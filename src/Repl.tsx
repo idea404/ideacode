@@ -1,0 +1,1249 @@
+/**
+ * Main REPL UI: input, log viewport, slash/@ suggestions, modals (model picker, palette), API loop and tool dispatch.
+ */
+import React, { useState, useCallback, useRef, useMemo, useEffect } from "react";
+import { Box, Text, useInput, useStdout } from "ink";
+import { globSync } from "glob";
+import * as path from "node:path";
+import gradient from "gradient-string";
+
+// Custom matcha-themed gradient: matcha green → dark sepia
+const matchaGradient = gradient(["#7F9A65", "#5C4033"]);
+import { getModel, saveModel, saveBraveSearchApiKey, getBraveSearchApiKey } from "./config.js";
+import { callApi, fetchModels, type OpenRouterModel } from "./api.js";
+import { estimateTokens, ensureUnderBudget } from "./context.js";
+import { runTool } from "./tools/index.js";
+import { COMMANDS, matchCommand, resolveCommand } from "./commands.js";
+import {
+  colors,
+  icons,
+  separator,
+  agentMessage,
+  toolCallBox,
+  toolResultLine,
+  inkColors,
+} from "./ui/index.js";
+
+function wordStartBackward(value: string, cursor: number): number {
+  let i = cursor - 1;
+  while (i >= 0 && /\s/.test(value[i]!)) i--;
+  while (i >= 0 && /[\w]/.test(value[i]!)) i--;
+  return i + 1;
+}
+
+function wordEndForward(value: string, cursor: number): number {
+  let i = cursor;
+  while (i < value.length && /[\w]/.test(value[i]!)) i++;
+  return i;
+}
+
+const CONTEXT_WINDOW_K = 128;
+const MAX_AT_SUGGESTIONS = 12;
+const INITIAL_BANNER_LINES = 12;
+const isMac = process.platform === "darwin";
+const pasteShortcut = isMac ? "Cmd+V" : "Ctrl+V";
+
+function listFilesWithFilter(cwd: string, filter: string): string[] {
+  try {
+    const pattern = path.join(cwd, "**", "*").replace(/\\/g, "/");
+    const files = globSync(pattern, { cwd, nodir: true, dot: true });
+    const rel = files.map((f) => path.relative(cwd, f).replace(/\\/g, "/"));
+    const f = filter.toLowerCase();
+    if (!f) return rel.slice(0, MAX_AT_SUGGESTIONS);
+    return rel.filter((p) => p.toLowerCase().includes(f)).slice(0, MAX_AT_SUGGESTIONS);
+  } catch {
+    return [];
+  }
+}
+
+type InputSegment = { type: "normal" | "path"; text: string };
+
+function parseAtSegments(value: string): InputSegment[] {
+  const segments: InputSegment[] = [];
+  let pos = 0;
+  while (pos < value.length) {
+    const at = value.indexOf("@", pos);
+    if (at === -1) {
+      segments.push({ type: "normal", text: value.slice(pos) });
+      break;
+    }
+    segments.push({ type: "normal", text: value.slice(pos, at) });
+    let end = at + 1;
+    while (end < value.length && value[end] !== " " && value[end] !== "\n") end++;
+    segments.push({ type: "path", text: value.slice(at, end) });
+    pos = end;
+  }
+  return segments;
+}
+
+const PROMPT_INDENT_LEN = 2;
+
+function wrapLine(line: string, width: number): string[] {
+  if (width < 1) return [line];
+  const out: string[] = [];
+  for (let i = 0; i < line.length; i += width) {
+    out.push(line.slice(i, i + width));
+  }
+  return out.length > 0 ? out : [""];
+}
+
+type ReplProps = {
+  apiKey: string;
+  cwd: string;
+  onQuit: () => void;
+};
+
+function useTerminalSize(): { rows: number; columns: number } {
+  const { stdout } = useStdout();
+  const [size, setSize] = useState(() => ({
+    rows: stdout?.rows ?? 24,
+    columns: stdout?.columns ?? 80,
+  }));
+  useEffect(() => {
+    if (!stdout?.isTTY) return;
+    const onResize = () => setSize({ rows: stdout.rows ?? 24, columns: stdout.columns ?? 80 });
+    stdout.on("resize", onResize);
+    onResize();
+    return () => {
+      stdout.off("resize", onResize);
+    };
+  }, [stdout]);
+  return size;
+}
+
+export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
+  const { rows: termRows, columns: termColumns } = useTerminalSize();
+  // Big ASCII art logo for ideacode
+  const bigLogo = `
+  ██╗██████╗ ███████╗ █████╗  ██████╗ ██████╗ ██████╗ ███████╗
+  ██║██╔══██╗██╔════╝██╔══██╗██╔════╝██╔═══██╗██╔══██╗██╔════╝
+  ██║██║  ██║█████╗  ███████║██║     ██║   ██║██║  ██║█████╗  
+  ██║██║  ██║██╔══╝  ██╔══██║██║     ██║   ██║██║  ██║██╔══╝  
+  ██║██████╔╝███████╗██║  ██║╚██████╗╚██████╔╝██████╔╝███████╗
+  ╚═╝╚═════╝ ╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝
+  `;
+
+  const [logLines, setLogLines] = useState<string[]>(() => {
+    const model = getModel();
+    return [
+      "",
+      matchaGradient(bigLogo),
+      colors.accent(`  ${model}`) + colors.dim(" · ") + colors.accentPale("OpenRouter") + colors.dim(` · ${cwd}`),
+      colors.mutedDark("  / commands  ! shell  @ files · Ctrl+P palette · Ctrl+C or /q to quit"),
+      "",
+    ];
+  });
+  const [inputValue, setInputValue] = useState("");
+  const [currentModel, setCurrentModel] = useState(getModel);
+  const [messages, setMessages] = useState<Array<{ role: string; content: unknown }>>([]);
+  const [loading, setLoading] = useState(false);
+  const [showPalette, setShowPalette] = useState(false);
+  const [paletteIndex, setPaletteIndex] = useState(0);
+  const [showModelSelector, setShowModelSelector] = useState(false);
+  const [modelList, setModelList] = useState<OpenRouterModel[]>([]);
+  const [modelIndex, setModelIndex] = useState(0);
+  const [modelSearchFilter, setModelSearchFilter] = useState("");
+  const [showBraveKeyModal, setShowBraveKeyModal] = useState(false);
+  const [braveKeyInput, setBraveKeyInput] = useState("");
+  const [showHelpModal, setShowHelpModal] = useState(false);
+  const [slashSuggestionIndex, setSlashSuggestionIndex] = useState(0);
+  const [inputCursor, setInputCursor] = useState(0);
+  const skipNextSubmitRef = useRef(false);
+  const queuedMessageRef = useRef<string | null>(null);
+  const lastUserMessageRef = useRef<string>("");
+  const [lastUserPrompt, setLastUserPrompt] = useState("");
+  const [logScrollOffset, setLogScrollOffset] = useState(0);
+  const prevEscRef = useRef(false);
+  const [spinnerTick, setSpinnerTick] = useState(0);
+  const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+  const estimatedTokens = useMemo(() => estimateTokens(messages, undefined), [messages]);
+  const contextWindowK = useMemo(() => {
+    const ctx = modelList.find((m) => m.id === currentModel)?.context_length;
+    return ctx != null ? Math.round(ctx / 1024) : CONTEXT_WINDOW_K;
+  }, [modelList, currentModel]);
+  const tokenDisplay = `${Math.round(estimatedTokens / 1000)}K / ${contextWindowK}K`;
+
+  const filteredModelList = useMemo(() => {
+    const q = modelSearchFilter.trim().toLowerCase();
+    if (!q) return modelList;
+    return modelList.filter(
+      (m) =>
+        m.id.toLowerCase().includes(q) ||
+        (m.name ?? "").toLowerCase().includes(q)
+    );
+  }, [modelList, modelSearchFilter]);
+
+  useEffect(() => {
+    setInputCursor((c) => Math.min(c, Math.max(0, inputValue.length)));
+  }, [inputValue.length]);
+
+  useEffect(() => {
+    if (apiKey) fetchModels(apiKey).then(setModelList);
+  }, [apiKey]);
+
+  useEffect(() => {
+    if (showModelSelector) {
+      setModelSearchFilter("");
+      setModelIndex(0);
+    }
+  }, [showModelSelector]);
+
+  useEffect(() => {
+    if (showModelSelector && filteredModelList.length > 0)
+      setModelIndex((i) => Math.min(i, filteredModelList.length - 1));
+  }, [showModelSelector, filteredModelList.length]);
+
+  useEffect(() => {
+    if (!loading) return;
+    const t = setInterval(() => setSpinnerTick((n) => n + 1), 80);
+    return () => clearInterval(t);
+  }, [loading]);
+
+  const showSlashSuggestions = inputValue.startsWith("/");
+  const filteredSlashCommands = useMemo(() => {
+    const filter = inputValue.slice(1).trim();
+    return COMMANDS.filter((c) => matchCommand(filter, c));
+  }, [inputValue]);
+  const clampedSlashIndex = Math.min(
+    Math.max(0, slashSuggestionIndex),
+    Math.max(0, filteredSlashCommands.length - 1)
+  );
+  useEffect(() => {
+    setSlashSuggestionIndex(0);
+  }, [inputValue]);
+
+  const lastAtIndex = inputValue.lastIndexOf("@");
+  const atPathEnd =
+    lastAtIndex < 0
+      ? -1
+      : (() => {
+          let end = lastAtIndex + 1;
+          while (end < inputValue.length && inputValue[end] !== " " && inputValue[end] !== "\n") end++;
+          return end;
+        })();
+  const cursorInAtSegment =
+    lastAtIndex >= 0 &&
+    inputCursor >= lastAtIndex &&
+    inputCursor <= atPathEnd;
+  const hasCharsAfterAt = atPathEnd > lastAtIndex + 1;
+  const atFilter = cursorInAtSegment ? inputValue.slice(lastAtIndex + 1, inputCursor) : "";
+  const lastAtPath =
+    lastAtIndex >= 0 && atPathEnd > lastAtIndex
+      ? inputValue.slice(lastAtIndex + 1, atPathEnd).trim()
+      : "";
+  const filteredFilePaths = useMemo(
+    () => (cursorInAtSegment ? listFilesWithFilter(cwd, atFilter) : []),
+    [cwd, cursorInAtSegment, atFilter]
+  );
+  const lastAtPathMatches = useMemo(
+    () =>
+      lastAtPath.length > 0 ? listFilesWithFilter(cwd, lastAtPath).includes(lastAtPath) : false,
+    [cwd, lastAtPath]
+  );
+  const showAtSuggestions =
+    cursorInAtSegment && hasCharsAfterAt && filteredFilePaths.length > 0;
+  const [atSuggestionIndex, setAtSuggestionIndex] = useState(0);
+  const clampedAtFileIndex = Math.min(
+    Math.max(0, atSuggestionIndex),
+    Math.max(0, filteredFilePaths.length - 1)
+  );
+  useEffect(() => {
+    setAtSuggestionIndex(0);
+  }, [atFilter]);
+
+  const appendLog = useCallback((line: string) => {
+    const lines = line.split("\n");
+    if (lines.length > 1 && lines[0] === "") lines.shift();
+    setLogLines((prev) => [...prev, ...lines]);
+  }, []);
+
+  const braveKeyHadExistingRef = useRef(false);
+  const BRAVE_KEY_PLACEHOLDER = "••••••••";
+
+  const openBraveKeyModal = useCallback(() => {
+    const existing = getBraveSearchApiKey();
+    braveKeyHadExistingRef.current = !!existing;
+    setBraveKeyInput(existing ? BRAVE_KEY_PLACEHOLDER : "");
+    setShowBraveKeyModal(true);
+  }, []);
+
+  const openHelpModal = useCallback(() => setShowHelpModal(true), []);
+
+  const openModelSelector = useCallback(async () => {
+    setShowPalette(false);
+    const models = await fetchModels(apiKey);
+    setModelList(models);
+    setModelIndex(0);
+    setShowModelSelector(true);
+  }, [apiKey]);
+
+  const processInput = useCallback(
+    async (value: string): Promise<boolean> => {
+      const userInput = value.trim();
+      if (!userInput) return true;
+
+      const isShellCommand = userInput[0] === "!" || userInput[0] === "\uFF01";
+      if (isShellCommand) {
+        const cmd = userInput.slice(1).trim();
+        if (!cmd) return true;
+        appendLog(separator());
+        appendLog(colors.accent(icons.prompt) + " ! " + cmd);
+        appendLog(separator());
+        const output = await runTool("bash", { cmd });
+        const maxShellOutput = 2000;
+        const outPreview =
+          output.length > maxShellOutput
+            ? output.slice(0, maxShellOutput) + "\n... (" + (output.length - maxShellOutput) + " more chars)"
+            : output;
+        for (const line of outPreview.split("\n")) {
+          appendLog(toolResultLine(line));
+        }
+        appendLog("");
+        setMessages((prev) => [
+          ...prev,
+          { role: "user", content: userInput + "\n---\n" + output },
+        ]);
+        return true;
+      }
+
+      const canonical = resolveCommand(userInput);
+      if (canonical === "/q") return false;
+      if (canonical === "/clear") {
+        setMessages([]);
+        setLogScrollOffset(0);
+        appendLog(colors.success(`${icons.clear} Cleared conversation`));
+        appendLog("");
+        return true;
+      }
+      if (canonical === "/palette" || userInput === "/") {
+        setShowPalette(true);
+        return true;
+      }
+      if (canonical === "/models") {
+        await openModelSelector();
+        return true;
+      }
+      if (canonical === "/brave") {
+        openBraveKeyModal();
+        return true;
+      }
+      if (canonical === "/help") {
+        openHelpModal();
+        return true;
+      }
+      if (canonical === "/status") {
+        appendLog(
+          colors.muted(`  ${currentModel}`) +
+            colors.dim(" · ") +
+            colors.accent(cwd) +
+            colors.dim(` · ${messages.length} messages`)
+        );
+        appendLog("");
+        return true;
+      }
+
+      if (messages.length === 0) {
+        setLogLines([]);
+        setLogScrollOffset(0);
+      }
+      lastUserMessageRef.current = userInput;
+      setLastUserPrompt(userInput);
+
+      let state: Array<{ role: string; content: unknown }> = [...messages, { role: "user", content: userInput }];
+      const systemPrompt = `Concise coding assistant. cwd: ${cwd}. Use focused greps (specific patterns, narrow paths) and read in chunks when files are large; avoid one huge grep or read that floods context. When exploring a dependency, set path to that package (e.g. node_modules/<pkg>) and list/read only what you need.`;
+
+      const modelContext = modelList.find((m) => m.id === currentModel)?.context_length;
+      const maxContextTokens = Math.floor((modelContext ?? CONTEXT_WINDOW_K * 1024) * 0.85);
+      const stateBeforeCompress = state;
+      state = await ensureUnderBudget(apiKey, state, systemPrompt, currentModel, {
+        maxTokens: maxContextTokens,
+        keepLast: 6,
+      });
+      if (state.length < stateBeforeCompress.length) {
+        appendLog(colors.muted("  (context compressed to stay under limit)\n"));
+      }
+
+      for (;;) {
+        setLoading(true);
+
+        const response = await callApi(apiKey, state, systemPrompt, currentModel);
+        setLoading(false);
+
+        const contentBlocks = response.content ?? [];
+        const toolResults: Array<{ type: string; tool_use_id: string; content: string }> = [];
+        for (let bi = 0; bi < contentBlocks.length; bi++) {
+          const block = contentBlocks[bi]!;
+          if (block.type === "text" && block.text) {
+            appendLog("");
+            appendLog(agentMessage(block.text).trimEnd());
+          }
+          if (block.type === "tool_use" && block.name && block.input) {
+            const toolName = block.name;
+            const toolArgs = block.input as Record<string, string | number | boolean | undefined>;
+            const firstVal = Object.values(toolArgs)[0];
+            const argPreview = String(firstVal ?? "").slice(0, 50);
+            const result = await runTool(toolName, toolArgs);
+            const ok = !result.startsWith("error:");
+            appendLog(toolCallBox(toolName, argPreview, ok));
+
+            const resultLines = result.split("\n");
+            let preview = resultLines[0]?.slice(0, 60) ?? "";
+            if (resultLines.length > 1) preview += ` ... +${resultLines.length - 1} lines`;
+            else if (preview.length > 60) preview += "...";
+            appendLog(toolResultLine(preview, ok));
+
+            if (block.id) {
+              toolResults.push({ type: "tool_result", tool_use_id: block.id, content: result });
+            }
+          }
+        }
+
+        state = [...state, { role: "assistant", content: contentBlocks }];
+        if (toolResults.length === 0) {
+          setMessages(state);
+          break;
+        }
+        state = [...state, { role: "user", content: toolResults }];
+        setMessages(state);
+      }
+
+      return true;
+    },
+    [apiKey, cwd, currentModel, messages, modelList, appendLog, openModelSelector, openBraveKeyModal, openHelpModal]
+  );
+
+  const handleSubmit = useCallback(
+    async (value: string) => {
+      if (skipNextSubmitRef.current) {
+        skipNextSubmitRef.current = false;
+        return;
+      }
+      const trimmed = value.trim();
+      if (trimmed === "/models") {
+        setInputValue("");
+        setInputCursor(0);
+        openModelSelector();
+        return;
+      }
+      if (trimmed === "/brave") {
+        setInputValue("");
+        setInputCursor(0);
+        openBraveKeyModal();
+        return;
+      }
+      if (trimmed === "/help" || trimmed === "/?") {
+        setInputValue("");
+        setInputCursor(0);
+        openHelpModal();
+        return;
+      }
+      setInputValue("");
+      setInputCursor(0);
+      try {
+        const cont = await processInput(value);
+        if (!cont) {
+          onQuit();
+          return;
+        }
+        const queued = queuedMessageRef.current;
+        if (queued) {
+          queuedMessageRef.current = null;
+          await processInput(queued);
+        }
+      } catch (err) {
+        appendLog(colors.error(`${icons.error} ${err instanceof Error ? err.message : String(err)}`));
+        appendLog("");
+      }
+    },
+    [processInput, onQuit, appendLog, openModelSelector, openBraveKeyModal, openHelpModal]
+  );
+
+  useInput((input, key) => {
+    if (showHelpModal) {
+      setShowHelpModal(false);
+      return;
+    }
+    if (showBraveKeyModal) {
+      if (key.return) {
+        const isPlaceholder = braveKeyInput === BRAVE_KEY_PLACEHOLDER;
+        const isEmpty = !braveKeyInput.trim();
+        const unchanged = isPlaceholder || (braveKeyHadExistingRef.current && isEmpty);
+        const keyToSave = unchanged ? "" : braveKeyInput.trim();
+        if (keyToSave) saveBraveSearchApiKey(keyToSave);
+        setShowBraveKeyModal(false);
+        setBraveKeyInput("");
+        appendLog(keyToSave ? colors.success("Brave Search API key saved. web_search is now available.") : colors.muted("Brave key unchanged."));
+        appendLog("");
+      } else if (key.escape) {
+        setShowBraveKeyModal(false);
+        setBraveKeyInput("");
+      } else if (key.backspace || key.delete) {
+        setBraveKeyInput((prev) => (prev === BRAVE_KEY_PLACEHOLDER ? "" : prev.slice(0, -1)));
+      } else if (input && !key.ctrl && !key.meta && input !== "\b" && input !== "\x7f") {
+        setBraveKeyInput((prev) => (prev === BRAVE_KEY_PLACEHOLDER ? input : prev + input));
+      }
+      return;
+    }
+    if (showModelSelector) {
+      if (key.upArrow) setModelIndex((i) => Math.max(0, i - 1));
+      else if (key.downArrow) setModelIndex((i) => Math.min(filteredModelList.length - 1, i + 1));
+      else if (key.return) {
+        const selected = filteredModelList[modelIndex]?.id;
+        if (selected) {
+          saveModel(selected);
+          setCurrentModel(selected);
+          appendLog(colors.success(`Model set to ${selected}`));
+          appendLog("");
+        }
+        setShowModelSelector(false);
+      } else if (key.escape) setShowModelSelector(false);
+      else if (key.backspace || key.delete) {
+        setModelSearchFilter((prev) => prev.slice(0, -1));
+      } else if (input && !key.ctrl && !key.meta && input !== "\b" && input !== "\x7f") {
+        setModelSearchFilter((prev) => prev + input);
+        setModelIndex(0);
+      }
+      return;
+    }
+    if (showPalette) {
+      const paletteCount = COMMANDS.length + 1;
+      if (key.upArrow) setPaletteIndex((i) => Math.max(0, i - 1));
+      else if (key.downArrow) setPaletteIndex((i) => Math.min(paletteCount - 1, i + 1));
+      else if (key.return) {
+        if (paletteIndex < COMMANDS.length) {
+          const selected = COMMANDS[paletteIndex];
+          if (selected) {
+            setShowPalette(false);
+            processInput(selected.cmd).then((cont) => {
+              if (!cont) onQuit();
+            }).catch((err) => {
+              appendLog(colors.error(`${icons.error} ${err instanceof Error ? err.message : String(err)}`));
+              appendLog("");
+            });
+          }
+        }
+        setShowPalette(false);
+        return;
+      } else if (key.escape) setShowPalette(false);
+      return;
+    }
+    if (showSlashSuggestions && filteredSlashCommands.length > 0) {
+      if (key.upArrow) {
+        setSlashSuggestionIndex((i) => Math.max(0, i - 1));
+        return;
+      }
+      if (key.downArrow) {
+        setSlashSuggestionIndex((i) => Math.min(filteredSlashCommands.length - 1, i + 1));
+        return;
+      }
+      if (key.tab) {
+        const selected = filteredSlashCommands[clampedSlashIndex];
+        if (selected) {
+          setInputValue(selected.cmd);
+          setInputCursor(selected.cmd.length);
+        }
+        return;
+      }
+      if (key.return) {
+        const selected = filteredSlashCommands[clampedSlashIndex];
+        if (selected) {
+          skipNextSubmitRef.current = true;
+          setInputValue("");
+          setInputCursor(0);
+          if (selected.cmd === "/models") {
+            openModelSelector();
+            return;
+          }
+          if (selected.cmd === "/brave") {
+            openBraveKeyModal();
+            return;
+          }
+          if (selected.cmd === "/help") {
+            openHelpModal();
+            return;
+          }
+          processInput(selected.cmd).then((cont) => {
+            if (!cont) onQuit();
+          }).catch((err) => {
+            appendLog(colors.error(`${icons.error} ${err instanceof Error ? err.message : String(err)}`));
+            appendLog("");
+          });
+          return;
+        }
+      }
+      if (key.escape) {
+        setInputValue("");
+        setInputCursor(0);
+        return;
+      }
+    }
+    if (cursorInAtSegment) {
+      if (key.escape) {
+        setInputValue((prev) => {
+          const lastAt = prev.lastIndexOf("@");
+          return lastAt >= 0 ? prev.slice(0, lastAt) + prev.slice(inputCursor) : prev;
+        });
+        setInputCursor(lastAtIndex);
+        return;
+      }
+      if (filteredFilePaths.length > 0) {
+        if (key.upArrow) {
+          setAtSuggestionIndex((i) => Math.max(0, i - 1));
+          return;
+        }
+        if (key.downArrow) {
+          setAtSuggestionIndex((i) => Math.min(filteredFilePaths.length - 1, i + 1));
+          return;
+        }
+        if (key.tab) {
+          const selected = filteredFilePaths[clampedAtFileIndex];
+          if (selected !== undefined) {
+            const cur = inputCursor;
+            const lastAt = inputValue.lastIndexOf("@");
+            const replacement = "@" + selected;
+            setInputValue((prev) => prev.slice(0, lastAt) + replacement + " " + prev.slice(cur));
+            setInputCursor(lastAt + replacement.length + 1);
+          }
+          return;
+        }
+      }
+    }
+    if (!showModelSelector && !showPalette) {
+      const withModifier = key.ctrl || key.meta || key.shift;
+      const scrollUp =
+        key.pageUp ||
+        (key.upArrow && (withModifier || !inputValue.trim()));
+      const scrollDown =
+        key.pageDown ||
+        (key.downArrow && (withModifier || !inputValue.trim()));
+      if (scrollUp) {
+        setLogScrollOffset((prev) =>
+          Math.min(maxLogScrollOffset, prev + logViewportHeight)
+        );
+        return;
+      }
+      if (scrollDown) {
+        setLogScrollOffset((prev) => Math.max(0, prev - logViewportHeight));
+        return;
+      }
+      if (!key.escape) prevEscRef.current = false;
+      const len = inputValue.length;
+      const cur = inputCursor;
+      if (key.tab) {
+        if (inputValue.trim()) {
+          queuedMessageRef.current = inputValue;
+          setInputValue("");
+          setInputCursor(0);
+          appendLog(colors.muted("  Message queued. Send to run after this turn."));
+          appendLog("");
+        }
+        return;
+      }
+      if (key.escape) {
+        if (inputValue.length === 0) {
+          if (prevEscRef.current) {
+            prevEscRef.current = false;
+            const last = lastUserMessageRef.current;
+            if (last) {
+              setInputValue(last);
+              setInputCursor(last.length);
+              setMessages((prev) => (prev.length > 0 && prev[prev.length - 1]?.role === "user" ? prev.slice(0, -1) : prev));
+              appendLog(colors.muted("  Editing previous message. Submit to replace."));
+              appendLog("");
+            }
+          } else prevEscRef.current = true;
+        } else {
+          setInputValue("");
+          setInputCursor(0);
+          prevEscRef.current = false;
+        }
+        return;
+      }
+      if (key.return) {
+        handleSubmit(inputValue);
+        setInputValue("");
+        setInputCursor(0);
+        return;
+      }
+      if (key.ctrl && input === "u") {
+        setInputValue((prev) => prev.slice(cur));
+        setInputCursor(0);
+        return;
+      }
+      if (key.ctrl && input === "k") {
+        setInputValue((prev) => prev.slice(0, cur));
+        return;
+      }
+      const killWordBefore =
+        (key.ctrl && input === "w") ||
+        (key.meta && key.backspace) ||
+        (key.meta && key.delete && cur > 0);
+      if (killWordBefore) {
+        const start = wordStartBackward(inputValue, cur);
+        if (start < cur) {
+          setInputValue((prev) => prev.slice(0, start) + prev.slice(cur));
+          setInputCursor(start);
+        }
+        return;
+      }
+      if (key.meta && input === "d") {
+        const end = wordEndForward(inputValue, cur);
+        if (end > cur) {
+          setInputValue((prev) => prev.slice(0, cur) + prev.slice(end));
+        }
+        return;
+      }
+      if ((key.meta && key.leftArrow) || (key.ctrl && key.leftArrow)) {
+        setInputCursor(wordStartBackward(inputValue, cur));
+        return;
+      }
+      if ((key.meta && key.rightArrow) || (key.ctrl && key.rightArrow)) {
+        setInputCursor(wordEndForward(inputValue, cur));
+        return;
+      }
+      if (key.ctrl && input === "j") {
+        setInputValue((prev) => prev.slice(0, cur) + "\n" + prev.slice(cur));
+        setInputCursor(cur + 1);
+        return;
+      }
+      if (key.ctrl && input === "a") {
+        setInputCursor(0);
+        return;
+      }
+      if (key.ctrl && input === "e") {
+        setInputCursor(len);
+        return;
+      }
+      if (key.ctrl && input === "h") {
+        if (cur > 0) {
+          setInputValue((prev) => prev.slice(0, cur - 1) + prev.slice(cur));
+          setInputCursor(cur - 1);
+        }
+        return;
+      }
+      if (key.ctrl && input === "d") {
+        if (cur < len) {
+          setInputValue((prev) => prev.slice(0, cur) + prev.slice(cur + 1));
+        }
+        return;
+      }
+      if (key.backspace || (key.delete && cur > 0)) {
+        if (cur > 0) {
+          setInputValue((prev) => prev.slice(0, cur - 1) + prev.slice(cur));
+          setInputCursor(cur - 1);
+        }
+        return;
+      }
+      if (key.delete && cur < len) {
+        setInputValue((prev) => prev.slice(0, cur) + prev.slice(cur + 1));
+        return;
+      }
+      if (key.leftArrow) {
+        setInputCursor(Math.max(0, cur - 1));
+        return;
+      }
+      if (key.rightArrow) {
+        setInputCursor(Math.min(len, cur + 1));
+        return;
+      }
+      if (input === "?" && !inputValue.trim()) {
+        setShowHelpModal(true);
+        return;
+      }
+      if (input && !key.ctrl && !key.meta) {
+        setInputValue((prev) => prev.slice(0, cur) + input + prev.slice(cur));
+        setInputCursor(cur + input.length);
+        return;
+      }
+    }
+    if (key.ctrl && input === "p") {
+      setShowPalette(true);
+    }
+    if (key.ctrl && input === "c") {
+      onQuit();
+    }
+  });
+
+  if (showModelSelector) {
+    const modelModalMaxHeight = 18;
+    const modelModalWidth = 108;
+    const modelModalHeight = Math.min(filteredModelList.length + 4, modelModalMaxHeight);
+    const topPad = Math.max(0, Math.floor((termRows - modelModalHeight) / 2));
+    const leftPad = Math.max(0, Math.floor((termColumns - modelModalWidth) / 2));
+    const visibleModelCount = Math.min(filteredModelList.length, modelModalHeight - 4);
+    const modelScrollOffset = Math.max(0, Math.min(modelIndex - Math.floor(visibleModelCount / 2), filteredModelList.length - visibleModelCount));
+    const visibleModels = filteredModelList.slice(modelScrollOffset, modelScrollOffset + visibleModelCount);
+    return (
+      <Box flexDirection="column" height={termRows} overflow="hidden">
+        <Box height={topPad} />
+        <Box flexDirection="row">
+          <Box width={leftPad} />
+          <Box
+            flexDirection="column"
+            borderStyle="single"
+            borderColor={inkColors.primary}
+            paddingX={2}
+            paddingY={1}
+            width={modelModalWidth}
+            minHeight={modelModalHeight}
+          >
+            <Text bold> Select model </Text>
+            <Box flexDirection="row">
+              <Text color="gray"> Filter: </Text>
+              <Text>{modelSearchFilter || " "}</Text>
+              {modelSearchFilter.length > 0 && (
+                <Text dimColor color="gray">
+                  {" "}({filteredModelList.length} match{filteredModelList.length !== 1 ? "es" : ""})
+                </Text>
+              )}
+            </Box>
+            {visibleModels.length === 0 ? (
+              <Text color="gray"> No match — type to search by id or name </Text>
+            ) : (
+              visibleModels.map((m, i) => {
+                const actualIndex = modelScrollOffset + i;
+                return (
+                  <Text key={m.id} color={actualIndex === modelIndex ? inkColors.primary : undefined}>
+                    {actualIndex === modelIndex ? "› " : "  "}
+                    {m.name ? `${m.id} — ${m.name}` : m.id}
+                  </Text>
+                );
+              })
+            )}
+            <Text color="gray"> ↑/↓ select  Enter confirm  Esc cancel  Type to filter </Text>
+          </Box>
+        </Box>
+        <Box flexGrow={1} />
+      </Box>
+    );
+  }
+
+  const slashSuggestionBoxLines = showSlashSuggestions
+    ? 3 + Math.max(1, filteredSlashCommands.length)
+    : 0;
+  const atSuggestionBoxLines = cursorInAtSegment
+    ? 4 + Math.max(1, filteredFilePaths.length)
+    : 0;
+  const suggestionBoxLines = slashSuggestionBoxLines || atSuggestionBoxLines;
+  const wrapWidth = Math.max(10, termColumns - PROMPT_INDENT_LEN - 2);
+  const inputLineCount = (() => {
+    const lines = inputValue.split("\n");
+    return lines.reduce(
+      (sum, line) => sum + Math.max(1, Math.ceil(line.length / wrapWidth)),
+      0
+    );
+  })();
+  const lastPromptLineCount = lastUserPrompt ? lastUserPrompt.split("\n").length : 0;
+  const lastPromptLines = lastUserPrompt
+    ? (lastPromptLineCount > 3 ? 4 : lastPromptLineCount)
+    : 0;
+  const reservedLines =
+    1 + lastPromptLines + inputLineCount + (loading ? 2 : 1);
+  const logViewportHeight = Math.max(1, termRows - reservedLines - suggestionBoxLines);
+  const maxLogScrollOffset = Math.max(0, logLines.length - logViewportHeight);
+  const logStartIndex = Math.max(
+    0,
+    logLines.length - logViewportHeight - Math.min(logScrollOffset, maxLogScrollOffset)
+  );
+  const visibleLogLines = logLines.slice(logStartIndex, logStartIndex + logViewportHeight);
+
+  if (showHelpModal) {
+    const helpModalWidth = 56;
+    const helpTopPad = Math.max(0, Math.floor((termRows - 20) / 2));
+    const helpLeftPad = Math.max(0, Math.floor((termColumns - helpModalWidth) / 2));
+    return (
+      <Box flexDirection="column" height={termRows} overflow="hidden">
+        <Box height={helpTopPad} />
+        <Box flexDirection="row">
+          <Box width={helpLeftPad} />
+          <Box
+            flexDirection="column"
+            borderStyle="single"
+            borderColor={inkColors.primary}
+            paddingX={2}
+            paddingY={1}
+            width={helpModalWidth}
+          >
+            <Text bold> Help </Text>
+            <Text color="gray"> What you can do </Text>
+            <Box marginTop={1}>
+              <Text color={inkColors.primary}> Message </Text>
+              <Text color="gray"> Type and Enter to send to the agent. </Text>
+            </Box>
+            <Box marginTop={1}>
+              <Text color={inkColors.primary}> / </Text>
+              <Text color="gray"> Commands. Type / then pick: /models, /brave, /help, /clear, /status, /q. Ctrl+P palette. </Text>
+            </Box>
+            <Box marginTop={1}>
+              <Text color={inkColors.primary}> @ </Text>
+              <Text color="gray"> Attach files. Type @ then path; Tab to complete. </Text>
+            </Box>
+            <Box marginTop={1}>
+              <Text color={inkColors.primary}> ! </Text>
+              <Text color="gray"> Run a shell command. Type ! then the command. </Text>
+            </Box>
+            <Box marginTop={1}>
+              <Text color={inkColors.primary}> Scroll </Text>
+              <Text color="gray"> ↑/↓ when input empty, or Ctrl/Opt+↑/↓ to scroll chat. </Text>
+            </Box>
+            <Box marginTop={1}>
+              <Text color="gray"> Press any key to close </Text>
+            </Box>
+          </Box>
+        </Box>
+        <Box flexGrow={1} />
+      </Box>
+    );
+  }
+
+  if (showBraveKeyModal) {
+    const braveModalWidth = 52;
+    const topPad = Math.max(0, Math.floor((termRows - 6) / 2));
+    const leftPad = Math.max(0, Math.floor((termColumns - braveModalWidth) / 2));
+    return (
+      <Box flexDirection="column" height={termRows} overflow="hidden">
+        <Box height={topPad} />
+        <Box flexDirection="row">
+          <Box width={leftPad} />
+          <Box
+            flexDirection="column"
+            borderStyle="single"
+            borderColor={inkColors.primary}
+            paddingX={2}
+            paddingY={1}
+            width={braveModalWidth}
+          >
+            <Text bold> Brave Search API key </Text>
+            <Text color="gray"> Get one at https://brave.com/search/api </Text>
+            {braveKeyInput === BRAVE_KEY_PLACEHOLDER && (
+              <Text color="gray"> Key already set. Type or paste to replace. </Text>
+            )}
+            <Box flexDirection="row" marginTop={1}>
+              <Text color={inkColors.primary}> Key: </Text>
+              <Text>{braveKeyInput || "\u00A0"}</Text>
+            </Box>
+            <Text color="gray"> Enter to save, Esc to cancel </Text>
+          </Box>
+        </Box>
+        <Box flexGrow={1} />
+      </Box>
+    );
+  }
+
+  if (showPalette) {
+    const paletteModalHeight = COMMANDS.length + 4;
+    const paletteModalWidth = 52;
+    const topPad = Math.max(0, Math.floor((termRows - paletteModalHeight) / 2));
+    const leftPad = Math.max(0, Math.floor((termColumns - paletteModalWidth) / 2));
+    return (
+      <Box flexDirection="column" height={termRows} overflow="hidden">
+        <Box height={topPad} />
+        <Box flexDirection="row">
+          <Box width={leftPad} />
+          <Box
+            flexDirection="column"
+            borderStyle="single"
+            borderColor={inkColors.primary}
+            paddingX={2}
+            paddingY={1}
+            width={paletteModalWidth}
+            minHeight={paletteModalHeight}
+          >
+            <Text bold> Command palette </Text>
+            {COMMANDS.map((c, i) => (
+              <Text key={c.cmd} color={i === paletteIndex ? inkColors.primary : undefined}>
+                {i === paletteIndex ? "› " : "  "}
+                {c.cmd}
+                <Text color="gray"> — {c.desc}</Text>
+              </Text>
+            ))}
+            <Text color={paletteIndex === COMMANDS.length ? inkColors.primary : undefined}>
+              {paletteIndex === COMMANDS.length ? "› " : "  "}
+              Cancel (Esc)
+            </Text>
+            <Text color="gray"> ↑/↓ select, Enter confirm, Esc close </Text>
+          </Box>
+        </Box>
+        <Box flexGrow={1} />
+      </Box>
+    );
+  }
+
+  const footerLines = suggestionBoxLines + 1 + inputLineCount;
+  return (
+    <Box flexDirection="column" height={termRows} overflow="hidden">
+      <Box flexDirection="column" flexGrow={1} minHeight={0} overflow="hidden">
+        {lastUserPrompt ? (
+          <Box flexDirection="column">
+            {(() => {
+              const lines = lastUserPrompt.split("\n");
+              const showLines = lines.slice(0, 3);
+              const hasMore = lines.length > 3;
+              return (
+                <>
+                  <Box flexDirection="row">
+                    <Text color={inkColors.primary} dimColor>
+                      {icons.prompt} Last:{" "}
+                    </Text>
+                    <Text dimColor color="gray">
+                      {showLines[0] ?? ""}
+                    </Text>
+                  </Box>
+                  {showLines.slice(1).map((ln, i) => (
+                    <Box key={i} flexDirection="row" paddingLeft={8}>
+                      <Text dimColor color="gray">
+                        {ln}
+                      </Text>
+                    </Box>
+                  ))}
+                  {hasMore && (
+                    <Box flexDirection="row" paddingLeft={8}>
+                      <Text dimColor color="gray">
+                        …
+                      </Text>
+                    </Box>
+                  )}
+                </>
+              );
+            })()}
+          </Box>
+        ) : null}
+        <Box flexDirection="column" height={logViewportHeight} overflow="hidden">
+          {visibleLogLines.map((line, i) => (
+            <Text key={logLines.length - visibleLogLines.length + i}>
+              {line === "" ? "\u00A0" : line}
+            </Text>
+          ))}
+        </Box>
+        {loading && (
+          <Box flexDirection="row" marginTop={1} marginBottom={0}>
+            <Text color="gray">
+              {" "}
+              {SPINNER[spinnerTick % SPINNER.length]} Thinking…
+            </Text>
+          </Box>
+        )}
+      </Box>
+      <Box flexDirection="column" flexShrink={0} height={footerLines}>
+        {showSlashSuggestions && (
+          <Box flexDirection="column" marginBottom={0} paddingLeft={2} borderStyle="single" borderColor="gray">
+            {filteredSlashCommands.length === 0 ? (
+              <Text color="gray"> No match </Text>
+            ) : (
+              [...filteredSlashCommands].reverse().map((c, rev) => {
+                const i = filteredSlashCommands.length - 1 - rev;
+                return (
+                  <Text key={c.cmd} color={i === clampedSlashIndex ? inkColors.primary : undefined}>
+                    {i === clampedSlashIndex ? "› " : "  "}
+                    {c.cmd}
+                    <Text color="gray"> — {c.desc}</Text>
+                  </Text>
+                );
+              })
+            )}
+            <Text color="gray"> Commands (↑/↓ select, Enter run, Esc clear) </Text>
+          </Box>
+        )}
+        {cursorInAtSegment && !showSlashSuggestions && (
+          <Box flexDirection="column" marginBottom={0} paddingLeft={2} borderStyle="single" borderColor="gray">
+            {filteredFilePaths.length === 0 ? (
+              <Text color="gray"> {hasCharsAfterAt ? "No match" : "Type to search files"} </Text>
+            ) : (
+              [...filteredFilePaths].reverse().map((p, rev) => {
+                const i = filteredFilePaths.length - 1 - rev;
+                return (
+                  <Text key={p} color={i === clampedAtFileIndex ? inkColors.primary : undefined}>
+                    {i === clampedAtFileIndex ? "› " : "  "}
+                    {p}
+                  </Text>
+                );
+              })
+            )}
+            <Box flexDirection="row" marginTop={1}>
+              <Text color="gray"> Files (↑/↓ select, Enter/Tab complete, Esc clear) </Text>
+            </Box>
+          </Box>
+        )}
+      <Box flexDirection="row" marginTop={0}>
+        <Text color="gray" dimColor>
+          {" "}
+          {icons.tool} {tokenDisplay}
+        </Text>
+        <Text color="gray" dimColor>
+          {`  ·  / ! @  ↑/↓ scroll (when input empty) or Ctrl/Opt+↑/↓  Ctrl+J newline  Tab queue  Esc Esc edit  ${pasteShortcut} paste  Ctrl+C exit`}
+        </Text>
+      </Box>
+      <Box flexDirection="column" marginTop={0}>
+        {inputValue.length === 0 ? (
+          <Box flexDirection="row">
+            <Text color={inkColors.primary}>{icons.prompt} </Text>
+            <Text inverse color={inkColors.primary}> </Text>
+            <Text color="gray">Message or / for commands, @ for files, ! for shell, ? for help...</Text>
+          </Box>
+        ) : (
+          (() => {
+            const lines = inputValue.split("\n");
+            let lineStart = 0;
+            return (
+              <>
+                {lines.flatMap((lineText, lineIdx) => {
+                  const lineEnd = lineStart + lineText.length;
+                  const cursorOnThisLine = inputCursor >= lineStart && inputCursor <= lineEnd;
+                  const cursorOffsetInLine = cursorOnThisLine ? inputCursor - lineStart : -1;
+                  const currentLineStart = lineStart;
+                  lineStart = lineEnd + 1;
+                  const segments = parseAtSegments(lineText);
+                  let runIdx = 0;
+                  const segmentsWithStyle: Array<{
+                    start: number;
+                    end: number;
+                    style: { bold?: boolean; color?: string };
+                  }> = [];
+                  segments.forEach((seg) => {
+                    const start = runIdx;
+                    const end = runIdx + seg.text.length;
+                    runIdx = end;
+                    const segmentStartInInput = currentLineStart + start;
+                    const segmentEndInInput = currentLineStart + end;
+                    const isCurrentAtSegment =
+                      seg.type === "path" &&
+                      cursorOnThisLine &&
+                      cursorOffsetInLine >= start &&
+                      cursorOffsetInLine <= end;
+                    const segmentContainsLastAt =
+                      lastAtIndex >= segmentStartInInput && lastAtIndex <= segmentEndInInput;
+                    const pathPart = seg.text.slice(1).trim();
+                    const completedPathMatches =
+                      segmentContainsLastAt &&
+                      pathPart === lastAtPath &&
+                      lastAtPathMatches;
+                    const usePathStyle =
+                      seg.type === "path" &&
+                      seg.text.length > 1 &&
+                      ((isCurrentAtSegment && filteredFilePaths.length > 0) ||
+                        completedPathMatches);
+                    if (
+                      seg.type === "normal" &&
+                      start === 0 &&
+                      seg.text.startsWith("/") &&
+                      filteredSlashCommands.length > 0
+                    ) {
+                      const slashEnd =
+                        seg.text.indexOf(" ") === -1 ? seg.text.length : seg.text.indexOf(" ");
+                      segmentsWithStyle.push({
+                        start: 0,
+                        end: slashEnd,
+                        style: { bold: true, color: inkColors.path },
+                      });
+                      if (slashEnd < seg.text.length) {
+                        segmentsWithStyle.push({
+                          start: slashEnd,
+                          end,
+                          style: {},
+                        });
+                      }
+                    } else {
+                      segmentsWithStyle.push({
+                        start,
+                        end,
+                        style: usePathStyle ? { bold: true, color: inkColors.path } : {},
+                      });
+                    }
+                  });
+                  const visualLines = wrapLine(lineText, wrapWidth);
+                  return visualLines.map((visualChunk, v) => {
+                    const visualStart = v * wrapWidth;
+                    const visualEnd = Math.min((v + 1) * wrapWidth, lineText.length);
+                    const isLastVisualOfThisLine = v === visualLines.length - 1;
+                    const cursorAtEndOfVisual =
+                      isLastVisualOfThisLine && cursorOffsetInLine === visualEnd;
+                    const cursorPosInVisual =
+                      cursorOnThisLine &&
+                      cursorOffsetInLine >= visualStart &&
+                      (cursorOffsetInLine < visualEnd || cursorAtEndOfVisual)
+                        ? cursorOffsetInLine < visualEnd
+                          ? cursorOffsetInLine - visualStart
+                          : visualEnd - visualStart
+                        : -1;
+                    const lineNodes: React.ReactNode[] = [];
+                    if (lineText === "" && v === 0 && cursorOnThisLine) {
+                      lineNodes.push(
+                        <Text key="cursor" inverse color={inkColors.primary}>
+                          {"\u00A0"}
+                        </Text>
+                      );
+                    } else {
+                      let cursorRendered = false;
+                      segmentsWithStyle.forEach((seg, segIdx) => {
+                        const oStart = Math.max(visualStart, seg.start);
+                        const oEnd = Math.min(visualEnd, seg.end);
+                        if (oEnd <= oStart) return;
+                        const text = lineText.slice(oStart, oEnd);
+                        if (cursorPosInVisual >= 0) {
+                          const cursorInSeg =
+                            cursorPosInVisual >= oStart - visualStart &&
+                            cursorPosInVisual < oEnd - visualStart;
+                          if (cursorInSeg) {
+                            const segRel = cursorPosInVisual - (oStart - visualStart);
+                            const before = text.slice(0, segRel);
+                            const curChar = text[segRel] ?? "\u00A0";
+                            const after = text.slice(segRel + 1);
+                            const usePath = "color" in seg.style && !!seg.style.color;
+                            lineNodes.push(<Text key={`${segIdx}-a`} {...seg.style}>{before}</Text>);
+                            lineNodes.push(
+                              <Text
+                                key={`${segIdx}-b`}
+                                inverse
+                                color={usePath ? inkColors.path : inkColors.primary}
+                                bold={"bold" in seg.style && !!seg.style.bold}
+                              >
+                                {curChar}
+                              </Text>
+                            );
+                            lineNodes.push(<Text key={`${segIdx}-c`} {...seg.style}>{after}</Text>);
+                            cursorRendered = true;
+                          } else {
+                            lineNodes.push(<Text key={segIdx} {...seg.style}>{text}</Text>);
+                          }
+                        } else {
+                          lineNodes.push(<Text key={segIdx} {...seg.style}>{text}</Text>);
+                        }
+                      });
+                      if (cursorPosInVisual >= 0 && !cursorRendered) {
+                        lineNodes.push(
+                          <Text key="cursor-end" inverse color={inkColors.primary}>
+                            {"\u00A0"}
+                          </Text>
+                        );
+                      }
+                    }
+                    const isFirstRow = lineIdx === 0 && v === 0;
+                    const isLastLogicalLine = lineIdx === lines.length - 1;
+                    const isLastVisualOfLine = v === visualLines.length - 1;
+                    return (
+                      <Box key={`${lineIdx}-${v}`} flexDirection="row">
+                        {isFirstRow ? (
+                          <Text color={inkColors.primary}>{icons.prompt} </Text>
+                        ) : (
+                          <Text>{" ".repeat(PROMPT_INDENT_LEN)}</Text>
+                        )}
+                        {lineNodes}
+                        {isLastLogicalLine && isLastVisualOfLine && inputValue.startsWith("!") && (
+                          <Text dimColor color="gray">
+                            {"  — "}type a shell command to run
+                          </Text>
+                        )}
+                      </Box>
+                    );
+                  });
+                })}
+          </>
+        );
+      })()
+        )}
+      </Box>
+      </Box>
+    </Box>
+  );
+}
