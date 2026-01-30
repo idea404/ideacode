@@ -4,7 +4,7 @@ import { render } from "ink";
 import React from "react";
 import { getApiKey } from "./config.js";
 import { runOnboarding } from "./onboarding.js";
-import { Repl } from "./Repl.js";
+import { Repl } from "./repl.js";
 
 async function main(): Promise<void> {
   let apiKey = getApiKey();
