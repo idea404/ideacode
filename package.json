@@ -1,8 +1,16 @@
 {
   "name": "ideacode",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "CLI TUI for AI agents via OpenRouter — agentic loop, tools, markdown",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/idea404/ideacode.git"
+  },
+  "homepage": "https://github.com/idea404/ideacode#readme",
+  "bugs": {
+    "url": "https://github.com/idea404/ideacode/issues"
+  },
   "main": "dist/index.js",
   "bin": { "ideacode": "dist/index.js" },
   "files": ["dist", "README.md"],
