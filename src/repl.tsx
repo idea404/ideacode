@@ -13,6 +13,7 @@ import { getModel, saveModel, saveBraveSearchApiKey, getBraveSearchApiKey } from
 import { loadConversation, saveConversation } from "./conversation.js";
 import type { OpenRouterModel } from "./api.js";
 import { callApi, fetchModels } from "./api.js";
+import { getVersion, checkForUpdate } from "./version.js";
 import { estimateTokens, ensureUnderBudget } from "./context.js";
 import { runTool } from "./tools/index.js";
 import { COMMANDS, matchCommand, resolveCommand } from "./commands.js";
@@ -178,10 +179,11 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
 
   const [logLines, setLogLines] = useState<string[]>(() => {
     const model = getModel();
+    const version = getVersion();
     return [
       "",
       matchaGradient(bigLogo),
-      colors.accent(`  ${model}`) + colors.dim(" · ") + colors.accentPale("OpenRouter") + colors.dim(` · ${cwd}`),
+      colors.accent(`  ideacode v${version}`) + colors.dim(" · ") + colors.accentPale(model) + colors.dim(" · ") + colors.bold("OpenRouter") + colors.dim(` · ${cwd}`),
       colors.mutedDark("  / commands  ! shell  @ files · Ctrl+P palette · Ctrl+C or /q to quit"),
       "",
     ];
@@ -201,10 +203,11 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
     if (messages.length > 0 && !hasRestoredLogRef.current) {
       hasRestoredLogRef.current = true;
       const model = getModel();
+      const version = getVersion();
       const banner = [
         "",
         matchaGradient(bigLogo),
-        colors.accent(`  ${model}`) + colors.dim(" · ") + colors.accentPale("OpenRouter") + colors.dim(` · ${cwd}`),
+        colors.accent(`  ideacode v${version}`) + colors.dim(" · ") + colors.accent(model) + colors.dim(" · ") + colors.accentPale("OpenRouter") + colors.dim(` · ${cwd}`),
         colors.mutedDark("  / commands  ! shell  @ files · Ctrl+P palette · Ctrl+C or /q to quit"),
         "",
       ];
@@ -350,6 +353,14 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
     if (lines.length > 1 && lines[0] === "") lines.shift();
     setLogLines((prev) => [...prev, ...lines]);
   }, []);
+
+  useEffect(() => {
+    const version = getVersion();
+    checkForUpdate(version, (latest) => {
+      appendLog(colors.warn(`  Update available: ideacode ${latest} (you have ${version}). Run: npm i -g ideacode`));
+      appendLog("");
+    });
+  }, [appendLog]);
 
   const braveKeyHadExistingRef = useRef(false);
   const BRAVE_KEY_PLACEHOLDER = "••••••••";
