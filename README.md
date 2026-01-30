@@ -7,7 +7,7 @@ CLI TUI for interfacing with AI agents via OpenRouter. Agentic loop with tool us
 ## Setup
 
 ```bash
-npm install
+npm i -g ideacode
 ```
 
 `npm install` runs `playwright install chromium` automatically (for **web_fetch** on JS-rendered pages). If you skipped install scripts or see "Executable doesn't exist", run `npx playwright install chromium` once.
