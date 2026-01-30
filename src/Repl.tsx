@@ -10,6 +10,7 @@ import gradient from "gradient-string";
 // Custom matcha-themed gradient: matcha green → dark sepia
 const matchaGradient = gradient(["#7F9A65", "#5C4033"]);
 import { getModel, saveModel, saveBraveSearchApiKey, getBraveSearchApiKey } from "./config.js";
+import { loadConversation, saveConversation } from "./conversation.js";
 import { callApi, fetchModels, type OpenRouterModel } from "./api.js";
 import { estimateTokens, ensureUnderBudget } from "./context.js";
 import { runTool } from "./tools/index.js";
@@ -144,7 +145,32 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
   });
   const [inputValue, setInputValue] = useState("");
   const [currentModel, setCurrentModel] = useState(getModel);
-  const [messages, setMessages] = useState<Array<{ role: string; content: unknown }>>([]);
+  const [messages, setMessages] = useState<Array<{ role: string; content: unknown }>>(() =>
+    loadConversation(cwd)
+  );
+  const messagesRef = useRef(messages);
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
+  const saveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
+    saveDebounceRef.current = setTimeout(() => {
+      saveDebounceRef.current = null;
+      saveConversation(cwd, messages);
+    }, 500);
+    return () => {
+      if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
+    };
+  }, [cwd, messages]);
+
+  const handleQuit = useCallback(() => {
+    if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
+    saveConversation(cwd, messagesRef.current);
+    onQuit();
+  }, [cwd, onQuit]);
+
   const [loading, setLoading] = useState(false);
   const [showPalette, setShowPalette] = useState(false);
   const [paletteIndex, setPaletteIndex] = useState(0);
@@ -453,7 +479,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       try {
         const cont = await processInput(value);
         if (!cont) {
-          onQuit();
+          handleQuit();
           return;
         }
         const queued = queuedMessageRef.current;
@@ -466,7 +492,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         appendLog("");
       }
     },
-    [processInput, onQuit, appendLog, openModelSelector, openBraveKeyModal, openHelpModal]
+    [processInput, handleQuit, appendLog, openModelSelector, openBraveKeyModal, openHelpModal]
   );
 
   useInput((input, key) => {
@@ -526,7 +552,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
           if (selected) {
             setShowPalette(false);
             processInput(selected.cmd).then((cont) => {
-              if (!cont) onQuit();
+              if (!cont) handleQuit();
             }).catch((err) => {
               appendLog(colors.error(`${icons.error} ${err instanceof Error ? err.message : String(err)}`));
               appendLog("");
@@ -574,7 +600,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
             return;
           }
           processInput(selected.cmd).then((cont) => {
-            if (!cont) onQuit();
+            if (!cont) handleQuit();
           }).catch((err) => {
             appendLog(colors.error(`${icons.error} ${err instanceof Error ? err.message : String(err)}`));
             appendLog("");
@@ -771,7 +797,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       setShowPalette(true);
     }
     if (key.ctrl && input === "c") {
-      onQuit();
+      handleQuit();
     }
   });
 

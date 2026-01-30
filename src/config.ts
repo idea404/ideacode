@@ -9,6 +9,10 @@ const CONFIG_DIR = process.env.XDG_CONFIG_HOME
     : path.join(os.homedir(), ".config", "ideacode");
 const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
 
+export function getConfigDir(): string {
+  return CONFIG_DIR;
+}
+
 export type StoredConfig = {
   apiKey?: string;
   model?: string;
