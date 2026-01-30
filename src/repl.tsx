@@ -22,6 +22,7 @@ import {
   agentMessage,
   toolCallBox,
   toolResultLine,
+  userPromptBox,
   inkColors,
 } from "./ui/index.js";
 
@@ -97,6 +98,47 @@ function wrapLine(line: string, width: number): string[] {
   return out.length > 0 ? out : [""];
 }
 
+function replayMessagesToLogLines(
+  messages: Array<{ role: string; content: unknown }>
+): string[] {
+  const lines: string[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i]!;
+    if (msg.role === "user") {
+      if (typeof msg.content === "string") {
+        lines.push(...userPromptBox(msg.content).split("\n"), "");
+      } else if (Array.isArray(msg.content)) {
+        const prev = messages[i - 1];
+        const toolResults = msg.content as Array<{ tool_use_id?: string; content?: string }>;
+        if (prev?.role === "assistant" && Array.isArray(prev.content)) {
+          const blocks = prev.content as Array<{ type?: string; id?: string; name?: string; input?: Record<string, unknown> }>;
+          const toolUses = blocks.filter((b) => b.type === "tool_use");
+          for (const tr of toolResults) {
+            const block = toolUses.find((b) => b.id === tr.tool_use_id);
+            if (block?.name) {
+              const firstVal = block.input && typeof block.input === "object" ? Object.values(block.input)[0] : undefined;
+              const argPreview = String(firstVal ?? "").slice(0, 50);
+              const ok = !(tr.content ?? "").startsWith("error:");
+              lines.push(toolCallBox(block.name, argPreview, ok));
+              const preview = (tr.content ?? "").split("\n")[0]?.slice(0, 60) ?? "";
+              lines.push(toolResultLine(preview, ok));
+            }
+          }
+        }
+      }
+    } else if (msg.role === "assistant" && Array.isArray(msg.content)) {
+      const blocks = msg.content as Array<{ type?: string; text?: string }>;
+      for (const block of blocks) {
+        if (block.type === "text" && block.text) {
+          lines.push("");
+          lines.push(...agentMessage(block.text).trimEnd().split("\n"));
+        }
+      }
+    }
+  }
+  return lines;
+}
+
 type ReplProps = {
   apiKey: string;
   cwd: string;
@@ -149,9 +191,25 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
     loadConversation(cwd)
   );
   const messagesRef = useRef(messages);
+  const hasRestoredLogRef = useRef(false);
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
+
+  useEffect(() => {
+    if (messages.length > 0 && !hasRestoredLogRef.current) {
+      hasRestoredLogRef.current = true;
+      const model = getModel();
+      const banner = [
+        "",
+        matchaGradient(bigLogo),
+        colors.accent(`  ${model}`) + colors.dim(" · ") + colors.accentPale("OpenRouter") + colors.dim(` · ${cwd}`),
+        colors.mutedDark("  / commands  ! shell  @ files · Ctrl+P palette · Ctrl+C or /q to quit"),
+        "",
+      ];
+      setLogLines([...banner, ...replayMessagesToLogLines(messages)]);
+    }
+  }, [messages, cwd]);
 
   const saveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
@@ -186,7 +244,6 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
   const skipNextSubmitRef = useRef(false);
   const queuedMessageRef = useRef<string | null>(null);
   const lastUserMessageRef = useRef<string>("");
-  const [lastUserPrompt, setLastUserPrompt] = useState("");
   const [logScrollOffset, setLogScrollOffset] = useState(0);
   const prevEscRef = useRef(false);
   const [spinnerTick, setSpinnerTick] = useState(0);
@@ -383,7 +440,8 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         setLogScrollOffset(0);
       }
       lastUserMessageRef.current = userInput;
-      setLastUserPrompt(userInput);
+      appendLog(userPromptBox(userInput));
+      appendLog("");
 
       let state: Array<{ role: string; content: unknown }> = [...messages, { role: "user", content: userInput }];
       const systemPrompt = `Concise coding assistant. cwd: ${cwd}. Use focused greps (specific patterns, narrow paths) and read in chunks when files are large; avoid one huge grep or read that floods context. When exploring a dependency, set path to that package (e.g. node_modules/<pkg>) and list/read only what you need. Prefer grep or keyword search for the most recent or specific occurrence; avoid tail/read of thousands of lines. If a tool result says it was truncated, call the tool again with offset, limit, or a narrower pattern to get what you need.`;
@@ -870,12 +928,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       0
     );
   })();
-  const lastPromptLineCount = lastUserPrompt ? lastUserPrompt.split("\n").length : 0;
-  const lastPromptLines = lastUserPrompt
-    ? (lastPromptLineCount > 3 ? 4 : lastPromptLineCount)
-    : 0;
-  const reservedLines =
-    1 + lastPromptLines + inputLineCount + (loading ? 2 : 1);
+  const reservedLines = 1 + inputLineCount + (loading ? 2 : 1);
   const logViewportHeight = Math.max(1, termRows - reservedLines - suggestionBoxLines);
   const maxLogScrollOffset = Math.max(0, logLines.length - logViewportHeight);
   const logStartIndex = Math.max(
@@ -1010,41 +1063,6 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
   return (
     <Box flexDirection="column" height={termRows} overflow="hidden">
       <Box flexDirection="column" flexGrow={1} minHeight={0} overflow="hidden">
-        {lastUserPrompt ? (
-          <Box flexDirection="column">
-            {(() => {
-              const lines = lastUserPrompt.split("\n");
-              const showLines = lines.slice(0, 3);
-              const hasMore = lines.length > 3;
-              return (
-                <>
-                  <Box flexDirection="row">
-                    <Text color={inkColors.primary} dimColor>
-                      {icons.prompt} Last:{" "}
-                    </Text>
-                    <Text dimColor color="gray">
-                      {showLines[0] ?? ""}
-                    </Text>
-                  </Box>
-                  {showLines.slice(1).map((ln, i) => (
-                    <Box key={i} flexDirection="row" paddingLeft={8}>
-                      <Text dimColor color="gray">
-                        {ln}
-                      </Text>
-                    </Box>
-                  ))}
-                  {hasMore && (
-                    <Box flexDirection="row" paddingLeft={8}>
-                      <Text dimColor color="gray">
-                        …
-                      </Text>
-                    </Box>
-                  )}
-                </>
-              );
-            })()}
-          </Box>
-        ) : null}
         <Box flexDirection="column" height={logViewportHeight} overflow="hidden">
           {visibleLogLines.map((line, i) => (
             <Text key={logLines.length - visibleLogLines.length + i}>
