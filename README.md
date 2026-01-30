@@ -2,6 +2,8 @@
 
 CLI TUI for interfacing with AI agents via OpenRouter. Agentic loop with tool use, conversation history, and markdown output.
 
+![ideacode](ideacode.png)
+
 ## Setup
 
 ```bash
