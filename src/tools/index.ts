@@ -7,7 +7,7 @@ import type { ToolArgs, ToolDef } from "./types.js";
 
 export const TOOLS: Record<string, ToolDef> = {
   read: [
-    "Read file with line numbers (file path, not directory). Use limit to read a portion; avoid reading huge files in one go.",
+    "Read file with line numbers (file path, not directory). Use limit and offset to read a portion; avoid reading huge files in one go. Long output is truncated; use offset/limit to get more.",
     { path: "string", offset: "number?", limit: "number?" },
     readFile,
   ],
@@ -23,11 +23,15 @@ export const TOOLS: Record<string, ToolDef> = {
     globFiles,
   ],
   grep: [
-    "Search files for regex. With path '.' (default), .gitignore entries are excluded; use path node_modules/<pkg> to search one package. Prefer specific patterns and narrow path. Returns at most limit matches (default 50, max 100).",
+    "Search files for regex. Prefer specific patterns and narrow path; search for the most recent or relevant occurrence by keyword. With path '.' (default), .gitignore entries are excluded; use path node_modules/<pkg> to search one package. Returns at most limit matches (default 50, max 100). Long output is truncated.",
     { pat: "string", path: "string?", limit: "number?" },
     grepFiles,
   ],
-  bash: ["Run shell command", { cmd: "string" }, runBash],
+  bash: [
+    "Run shell command. Prefer targeted commands (e.g. grep, head, tail with small line count); avoid tail -1000 or dumping huge output.",
+    { cmd: "string" },
+    runBash,
+  ],
   web_fetch: [
     "Fetch a URL and return the main text content (handles JS-rendered pages). Use for docs, raw GitHub, any web page.",
     { url: "string" },

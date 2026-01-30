@@ -38,8 +38,17 @@ function wordEndForward(value: string, cursor: number): number {
 }
 
 const CONTEXT_WINDOW_K = 128;
+const MAX_TOOL_RESULT_CHARS = 3500;
 const MAX_AT_SUGGESTIONS = 12;
 const INITIAL_BANNER_LINES = 12;
+
+const TRUNCATE_NOTE =
+  "\n\n(Output truncated to save context. Use read with offset/limit, grep with a specific pattern, or tail with fewer lines to get more.)";
+
+function truncateToolResult(content: string): string {
+  if (content.length <= MAX_TOOL_RESULT_CHARS) return content;
+  return content.slice(0, MAX_TOOL_RESULT_CHARS) + TRUNCATE_NOTE;
+}
 const isMac = process.platform === "darwin";
 const pasteShortcut = isMac ? "Cmd+V" : "Ctrl+V";
 
@@ -351,7 +360,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       setLastUserPrompt(userInput);
 
       let state: Array<{ role: string; content: unknown }> = [...messages, { role: "user", content: userInput }];
-      const systemPrompt = `Concise coding assistant. cwd: ${cwd}. Use focused greps (specific patterns, narrow paths) and read in chunks when files are large; avoid one huge grep or read that floods context. When exploring a dependency, set path to that package (e.g. node_modules/<pkg>) and list/read only what you need.`;
+      const systemPrompt = `Concise coding assistant. cwd: ${cwd}. Use focused greps (specific patterns, narrow paths) and read in chunks when files are large; avoid one huge grep or read that floods context. When exploring a dependency, set path to that package (e.g. node_modules/<pkg>) and list/read only what you need. Prefer grep or keyword search for the most recent or specific occurrence; avoid tail/read of thousands of lines. If a tool result says it was truncated, call the tool again with offset, limit, or a narrower pattern to get what you need.`;
 
       const modelContext = modelList.find((m) => m.id === currentModel)?.context_length;
       const maxContextTokens = Math.floor((modelContext ?? CONTEXT_WINDOW_K * 1024) * 0.85);
@@ -394,7 +403,8 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
             appendLog(toolResultLine(preview, ok));
 
             if (block.id) {
-              toolResults.push({ type: "tool_result", tool_use_id: block.id, content: result });
+              const contentForApi = truncateToolResult(result);
+              toolResults.push({ type: "tool_result", tool_use_id: block.id, content: contentForApi });
             }
           }
         }
