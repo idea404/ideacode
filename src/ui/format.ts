@@ -55,6 +55,43 @@ export function header(title: string, subtitle: string): string {
   );
 }
 
+function wrapToWidth(text: string, width: number): string {
+  const lines: string[] = [];
+  for (const line of text.split("\n")) {
+    if (line.length <= width) {
+      lines.push(line);
+      continue;
+    }
+    let rest = line;
+    while (rest.length > 0) {
+      if (rest.length <= width) {
+        lines.push(rest);
+        break;
+      }
+      const chunk = rest.slice(0, width);
+      const lastSpace = chunk.lastIndexOf(" ");
+      const breakAt = lastSpace > width >> 1 ? lastSpace : width;
+      lines.push(rest.slice(0, breakAt).trimEnd());
+      rest = rest.slice(breakAt).trimStart();
+    }
+  }
+  return lines.join("\n");
+}
+
+export function userPromptBox(prompt: string): string {
+  const cols = process.stdout.columns ?? 80;
+  const boxWidth = Math.max(20, cols - 4);
+  const innerWidth = boxWidth - 2 - 2;
+  const text = wrapToWidth((prompt.trim() || "\u00A0"), innerWidth);
+  return boxen(text, {
+    width: boxWidth,
+    padding: { top: 0, bottom: 0, left: 1, right: 1 },
+    margin: { bottom: 0 },
+    borderColor: inkColors.primary,
+    borderStyle: "round",
+  });
+}
+
 const TOOL_INDENT = "  ";
 const toolSubdued = chalk.hex("#3d3d3d");
 
