@@ -11,7 +11,7 @@ import gradient from "gradient-string";
 const matchaGradient = gradient(["#7F9A65", "#5C4033"]);
 import { getModel, saveModel, saveBraveSearchApiKey, getBraveSearchApiKey } from "./config.js";
 import { loadConversation, saveConversation } from "./conversation.js";
-import type { OpenRouterModel } from "./api.js";
+import type { ContentBlock, OpenRouterModel } from "./api.js";
 import { callApi, fetchModels } from "./api.js";
 import { getVersion, checkForUpdate } from "./version.js";
 import { estimateTokens, estimateTokensForString, ensureUnderBudget } from "./context.js";
@@ -368,6 +368,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
   }, [atFilter]);
 
   const lastLogLineRef = useRef("");
+
   const appendLog = useCallback((line: string) => {
     const lines = line.split("\n");
     if (lines.length > 1 && lines[0] === "") lines.shift();
@@ -440,8 +441,16 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       if (canonical === "/clear") {
         setMessages([]);
         setLogScrollOffset(0);
-        appendLog(colors.success(`${icons.clear} Cleared conversation`));
-        appendLog("");
+        const model = getModel();
+        const version = getVersion();
+        const banner = [
+          "",
+          matchaGradient(bigLogo),
+          colors.accent(`  ideacode v${version}`) + colors.dim(" · ") + colors.accentPale(model) + colors.dim(" · ") + colors.bold("OpenRouter") + colors.dim(` · ${cwd}`),
+          colors.mutedDark("  / commands  ! shell  @ files · Ctrl+P palette · Ctrl+C or /q to quit"),
+          "",
+        ];
+        setLogLines(banner);
         return true;
       }
       if (canonical === "/palette" || userInput === "/") {
@@ -471,10 +480,6 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         return true;
       }
 
-      if (messages.length === 0) {
-        setLogLines([]);
-        setLogScrollOffset(0);
-      }
       lastUserMessageRef.current = userInput;
       appendLog("");
       appendLog(userPromptBox(userInput));
@@ -498,12 +503,10 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         setLoading(true);
 
         const response = await callApi(apiKey, state, systemPrompt, currentModel);
-        setLoading(false);
-
         const contentBlocks = response.content ?? [];
         const toolResults: Array<{ type: string; tool_use_id: string; content: string }> = [];
-        for (let bi = 0; bi < contentBlocks.length; bi++) {
-          const block = contentBlocks[bi]!;
+
+        for (const block of contentBlocks) {
           if (block.type === "text" && block.text?.trim()) {
             if (lastLogLineRef.current !== "") appendLog("");
             appendLog(agentMessage(block.text).trimEnd());
@@ -516,22 +519,19 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
             const result = await runTool(toolName, toolArgs);
             const ok = !result.startsWith("error:");
             appendLog(toolCallBox(toolName, argPreview, ok));
-
             const resultLines = result.split("\n");
             let preview = resultLines[0]?.slice(0, 80) ?? "";
             if (resultLines.length > 1) preview += ` ... +${resultLines.length - 1} lines`;
             else if (preview.length > 80) preview += "...";
             appendLog(toolResultLine(preview, ok));
-
             const contentForApi = truncateToolResult(result);
             const tokens = estimateTokensForString(contentForApi);
             appendLog(toolResultTokenLine(tokens, ok));
-
-            if (block.id) {
-              toolResults.push({ type: "tool_result", tool_use_id: block.id, content: contentForApi });
-            }
+            if (block.id) toolResults.push({ type: "tool_result", tool_use_id: block.id, content: contentForApi });
           }
         }
+
+        setLoading(false);
 
         state = [...state, { role: "assistant", content: contentBlocks }];
         if (toolResults.length === 0) {
@@ -682,7 +682,6 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       if (key.return) {
         const selected = filteredSlashCommands[clampedSlashIndex];
         if (selected) {
-          skipNextSubmitRef.current = true;
           setInputValue("");
           setInputCursor(0);
           if (selected.cmd === "/models") {
@@ -970,12 +969,13 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
   })();
   const reservedLines = 1 + inputLineCount + (loading ? 2 : 1);
   const logViewportHeight = Math.max(1, termRows - reservedLines - suggestionBoxLines);
-  const maxLogScrollOffset = Math.max(0, logLines.length - logViewportHeight);
+  const effectiveLogLines = logLines;
+  const maxLogScrollOffset = Math.max(0, effectiveLogLines.length - logViewportHeight);
   const logStartIndex = Math.max(
     0,
-    logLines.length - logViewportHeight - Math.min(logScrollOffset, maxLogScrollOffset)
+    effectiveLogLines.length - logViewportHeight - Math.min(logScrollOffset, maxLogScrollOffset)
   );
-  const visibleLogLines = logLines.slice(logStartIndex, logStartIndex + logViewportHeight);
+  const visibleLogLines = effectiveLogLines.slice(logStartIndex, logStartIndex + logViewportHeight);
 
   if (showHelpModal) {
     const helpModalWidth = 56;
@@ -1105,7 +1105,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       <Box flexDirection="column" flexGrow={1} minHeight={0} overflow="hidden">
         <Box flexDirection="column" height={logViewportHeight} overflow="hidden">
           {visibleLogLines.map((line, i) => (
-            <Text key={logLines.length - visibleLogLines.length + i}>
+            <Text key={effectiveLogLines.length - visibleLogLines.length + i}>
               {line === "" ? "\u00A0" : line}
             </Text>
           ))}

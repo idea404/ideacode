@@ -74,6 +74,7 @@ export function saveModel(model: string): void {
 
 export const config = {
   apiUrl: "https://openrouter.ai/api/v1/messages",
+  chatCompletionsUrl: "https://openrouter.ai/api/v1/chat/completions",
   modelsUrl: "https://openrouter.ai/api/v1/models",
   get apiKey() {
     return getApiKey();
