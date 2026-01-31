@@ -34,7 +34,7 @@ function isNewer(latest: string, current: string): boolean {
 }
 
 const UPDATE_CHECK_FILE = "last-update-check.json";
-const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const CHECK_INTERVAL_MS = 60 * 60 * 1000;
 
 function shouldSkipCheck(): boolean {
   try {
