@@ -120,7 +120,7 @@ function replayMessagesToLogLines(
             const block = toolUses.find((b) => b.id === tr.tool_use_id);
             if (block?.name) {
               const firstVal = block.input && typeof block.input === "object" ? Object.values(block.input)[0] : undefined;
-              const argPreview = String(firstVal ?? "").slice(0, 50);
+              const argPreview = String(firstVal ?? "").slice(0, 50) || "—";
               const content = tr.content ?? "";
               const ok = !content.startsWith("error:");
               lines.push(toolCallBox(block.name, argPreview, ok));
@@ -135,7 +135,7 @@ function replayMessagesToLogLines(
     } else if (msg.role === "assistant" && Array.isArray(msg.content)) {
       const blocks = msg.content as Array<{ type?: string; text?: string }>;
       for (const block of blocks) {
-        if (block.type === "text" && block.text) {
+        if (block.type === "text" && block.text?.trim()) {
           lines.push("");
           lines.push(...agentMessage(block.text).trimEnd().split("\n"));
         }
@@ -204,7 +204,8 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
   }, [messages]);
 
   useEffect(() => {
-    if (messages.length > 0 && !hasRestoredLogRef.current) {
+    const loaded = loadConversation(cwd);
+    if (loaded.length > 0 && !hasRestoredLogRef.current) {
       hasRestoredLogRef.current = true;
       const model = getModel();
       const version = getVersion();
@@ -215,9 +216,9 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         colors.mutedDark("  / commands  ! shell  @ files · Ctrl+P palette · Ctrl+C or /q to quit"),
         "",
       ];
-      setLogLines([...banner, ...replayMessagesToLogLines(messages)]);
+      setLogLines([...banner, ...replayMessagesToLogLines(loaded)]);
     }
-  }, [messages, cwd]);
+  }, [cwd]);
 
   const saveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
@@ -483,7 +484,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         const toolResults: Array<{ type: string; tool_use_id: string; content: string }> = [];
         for (let bi = 0; bi < contentBlocks.length; bi++) {
           const block = contentBlocks[bi]!;
-          if (block.type === "text" && block.text) {
+          if (block.type === "text" && block.text?.trim()) {
             appendLog("");
             appendLog(agentMessage(block.text).trimEnd());
           }
@@ -491,7 +492,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
             const toolName = block.name;
             const toolArgs = block.input as Record<string, string | number | boolean | undefined>;
             const firstVal = Object.values(toolArgs)[0];
-            const argPreview = String(firstVal ?? "").slice(0, 100);
+            const argPreview = String(firstVal ?? "").slice(0, 100) || "—";
             const result = await runTool(toolName, toolArgs);
             const ok = !result.startsWith("error:");
             appendLog(toolCallBox(toolName, argPreview, ok));
