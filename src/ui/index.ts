@@ -7,6 +7,7 @@ export {
   agentMessage,
   toolCallBox,
   toolResultLine,
+  toolResultTokenLine,
   userPromptBox,
   bashOutputLine,
   renderMarkdown,

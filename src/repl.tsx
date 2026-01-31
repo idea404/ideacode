@@ -14,7 +14,7 @@ import { loadConversation, saveConversation } from "./conversation.js";
 import type { OpenRouterModel } from "./api.js";
 import { callApi, fetchModels } from "./api.js";
 import { getVersion, checkForUpdate } from "./version.js";
-import { estimateTokens, ensureUnderBudget } from "./context.js";
+import { estimateTokens, estimateTokensForString, ensureUnderBudget } from "./context.js";
 import { runTool } from "./tools/index.js";
 import { COMMANDS, matchCommand, resolveCommand } from "./commands.js";
 import {
@@ -24,6 +24,7 @@ import {
   agentMessage,
   toolCallBox,
   toolResultLine,
+  toolResultTokenLine,
   userPromptBox,
   inkColors,
 } from "./ui/index.js";
@@ -120,10 +121,13 @@ function replayMessagesToLogLines(
             if (block?.name) {
               const firstVal = block.input && typeof block.input === "object" ? Object.values(block.input)[0] : undefined;
               const argPreview = String(firstVal ?? "").slice(0, 50);
-              const ok = !(tr.content ?? "").startsWith("error:");
+              const content = tr.content ?? "";
+              const ok = !content.startsWith("error:");
               lines.push(toolCallBox(block.name, argPreview, ok));
-              const preview = (tr.content ?? "").split("\n")[0]?.slice(0, 60) ?? "";
+              const preview = content.split("\n")[0]?.slice(0, 60) ?? "";
               lines.push(toolResultLine(preview, ok));
+              const tokens = estimateTokensForString(content);
+              lines.push(toolResultTokenLine(tokens, ok));
             }
           }
         }
@@ -487,19 +491,22 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
             const toolName = block.name;
             const toolArgs = block.input as Record<string, string | number | boolean | undefined>;
             const firstVal = Object.values(toolArgs)[0];
-            const argPreview = String(firstVal ?? "").slice(0, 50);
+            const argPreview = String(firstVal ?? "").slice(0, 100);
             const result = await runTool(toolName, toolArgs);
             const ok = !result.startsWith("error:");
             appendLog(toolCallBox(toolName, argPreview, ok));
 
             const resultLines = result.split("\n");
-            let preview = resultLines[0]?.slice(0, 60) ?? "";
+            let preview = resultLines[0]?.slice(0, 80) ?? "";
             if (resultLines.length > 1) preview += ` ... +${resultLines.length - 1} lines`;
-            else if (preview.length > 60) preview += "...";
+            else if (preview.length > 80) preview += "...";
             appendLog(toolResultLine(preview, ok));
 
+            const contentForApi = truncateToolResult(result);
+            const tokens = estimateTokensForString(contentForApi);
+            appendLog(toolResultTokenLine(tokens, ok));
+
             if (block.id) {
-              const contentForApi = truncateToolResult(result);
               toolResults.push({ type: "tool_result", tool_use_id: block.id, content: contentForApi });
             }
           }

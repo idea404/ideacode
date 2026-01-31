@@ -12,6 +12,10 @@ export function estimateTokens(messages: Message[], systemPrompt?: string): numb
   return Math.round(chars / 4);
 }
 
+export function estimateTokensForString(str: string): number {
+  return Math.round(str.length / 4);
+}
+
 export async function compressState(
   apiKey: string,
   state: Message[],

@@ -28,7 +28,7 @@ export const TOOLS: Record<string, ToolDef> = {
     grepFiles,
   ],
   bash: [
-    "Run shell command. Prefer targeted commands (e.g. grep, head, tail with small line count); avoid tail -1000 or dumping huge output.",
+    "Run shell command. Use for things the other tools don't cover (e.g. running tests, installs, one-off commands, ephemeral << PY scripts, etc.). Always avoid dump outputs. Prefer read/grep/glob for file content and search; use targeted commands and avoid dumping huge output.",
     { cmd: "string" },
     runBash,
   ],

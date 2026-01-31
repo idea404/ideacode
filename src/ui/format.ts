@@ -110,6 +110,18 @@ export function toolResultLine(preview: string, success = true): string {
   return `${TOOL_INDENT}${TOOL_INDENT}${pipeColor(icons.pipe + " ")}${textColor(preview)}`;
 }
 
+function formatTokenCount(n: number): string {
+  if (n >= 1000) return (n / 1000).toFixed(1).replace(/\.0$/, "") + "K";
+  return String(n);
+}
+
+export function toolResultTokenLine(tokens: number, success = true): string {
+  const pipeColor = success ? toolSubdued : colors.toolFail;
+  const textColor = success ? toolSubdued : colors.toolFail;
+  const tokenStr = `+${formatTokenCount(tokens)} tokens`;
+  return `${TOOL_INDENT}${TOOL_INDENT}${pipeColor(icons.pipe + " ")}${textColor(tokenStr)}`;
+}
+
 export function agentMessage(text: string): string {
   const rendered = renderMarkdown(text.trim());
   return `${colors.accentPale(icons.agent)} ${rendered}`;
