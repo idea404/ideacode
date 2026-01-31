@@ -109,7 +109,7 @@ function replayMessagesToLogLines(
     const msg = messages[i]!;
     if (msg.role === "user") {
       if (typeof msg.content === "string") {
-        lines.push(...userPromptBox(msg.content).split("\n"), "");
+        lines.push("", ...userPromptBox(msg.content).split("\n"), "");
       } else if (Array.isArray(msg.content)) {
         const prev = messages[i - 1];
         const toolResults = msg.content as Array<{ tool_use_id?: string; content?: string }>;
@@ -119,11 +119,12 @@ function replayMessagesToLogLines(
           for (const tr of toolResults) {
             const block = toolUses.find((b) => b.id === tr.tool_use_id);
             if (block?.name) {
+              const name = block.name.trim().toLowerCase();
               const firstVal = block.input && typeof block.input === "object" ? Object.values(block.input)[0] : undefined;
               const argPreview = String(firstVal ?? "").slice(0, 50) || "—";
               const content = tr.content ?? "";
               const ok = !content.startsWith("error:");
-              lines.push(toolCallBox(block.name, argPreview, ok));
+              lines.push(toolCallBox(name, argPreview, ok));
               const preview = content.split("\n")[0]?.slice(0, 60) ?? "";
               lines.push(toolResultLine(preview, ok));
               const tokens = estimateTokensForString(content);
@@ -136,7 +137,7 @@ function replayMessagesToLogLines(
       const blocks = msg.content as Array<{ type?: string; text?: string }>;
       for (const block of blocks) {
         if (block.type === "text" && block.text?.trim()) {
-          lines.push("");
+          if (lines[lines.length - 1] !== "") lines.push("");
           lines.push(...agentMessage(block.text).trimEnd().split("\n"));
         }
       }
@@ -181,16 +182,25 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
   ╚═╝╚═════╝ ╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝
   `;
 
+  const hasRestoredLogRef = useRef(false);
+  const restoredCwdRef = useRef<string | null>(null);
   const [logLines, setLogLines] = useState<string[]>(() => {
     const model = getModel();
     const version = getVersion();
-    return [
+    const banner = [
       "",
       matchaGradient(bigLogo),
       colors.accent(`  ideacode v${version}`) + colors.dim(" · ") + colors.accentPale(model) + colors.dim(" · ") + colors.bold("OpenRouter") + colors.dim(` · ${cwd}`),
       colors.mutedDark("  / commands  ! shell  @ files · Ctrl+P palette · Ctrl+C or /q to quit"),
       "",
     ];
+    const loaded = loadConversation(cwd);
+    if (loaded.length > 0) {
+      hasRestoredLogRef.current = true;
+      restoredCwdRef.current = cwd;
+      return [...banner, ...replayMessagesToLogLines(loaded)];
+    }
+    return banner;
   });
   const [inputValue, setInputValue] = useState("");
   const [currentModel, setCurrentModel] = useState(getModel);
@@ -198,26 +208,30 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
     loadConversation(cwd)
   );
   const messagesRef = useRef(messages);
-  const hasRestoredLogRef = useRef(false);
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
 
   useEffect(() => {
+    if (hasRestoredLogRef.current && restoredCwdRef.current === cwd) return;
     const loaded = loadConversation(cwd);
-    if (loaded.length > 0 && !hasRestoredLogRef.current) {
+    const model = getModel();
+    const version = getVersion();
+    const banner = [
+      "",
+      matchaGradient(bigLogo),
+      colors.accent(`  ideacode v${version}`) + colors.dim(" · ") + colors.accent(model) + colors.dim(" · ") + colors.accentPale("OpenRouter") + colors.dim(` · ${cwd}`),
+      colors.mutedDark("  / commands  ! shell  @ files · Ctrl+P palette · Ctrl+C or /q to quit"),
+      "",
+    ];
+    if (loaded.length > 0) {
       hasRestoredLogRef.current = true;
-      const model = getModel();
-      const version = getVersion();
-      const banner = [
-        "",
-        matchaGradient(bigLogo),
-        colors.accent(`  ideacode v${version}`) + colors.dim(" · ") + colors.accent(model) + colors.dim(" · ") + colors.accentPale("OpenRouter") + colors.dim(` · ${cwd}`),
-        colors.mutedDark("  / commands  ! shell  @ files · Ctrl+P palette · Ctrl+C or /q to quit"),
-        "",
-      ];
       setLogLines([...banner, ...replayMessagesToLogLines(loaded)]);
+    } else {
+      hasRestoredLogRef.current = false;
+      setLogLines(banner);
     }
+    restoredCwdRef.current = cwd;
   }, [cwd]);
 
   const saveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -353,10 +367,15 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
     setAtSuggestionIndex(0);
   }, [atFilter]);
 
+  const lastLogLineRef = useRef("");
   const appendLog = useCallback((line: string) => {
     const lines = line.split("\n");
     if (lines.length > 1 && lines[0] === "") lines.shift();
-    setLogLines((prev) => [...prev, ...lines]);
+    setLogLines((prev) => {
+      const next = [...prev, ...lines];
+      lastLogLineRef.current = next[next.length - 1] ?? "";
+      return next;
+    });
   }, []);
 
   useEffect(() => {
@@ -457,6 +476,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         setLogScrollOffset(0);
       }
       lastUserMessageRef.current = userInput;
+      appendLog("");
       appendLog(userPromptBox(userInput));
       appendLog("");
 
@@ -485,11 +505,11 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         for (let bi = 0; bi < contentBlocks.length; bi++) {
           const block = contentBlocks[bi]!;
           if (block.type === "text" && block.text?.trim()) {
-            appendLog("");
+            if (lastLogLineRef.current !== "") appendLog("");
             appendLog(agentMessage(block.text).trimEnd());
           }
           if (block.type === "tool_use" && block.name && block.input) {
-            const toolName = block.name;
+            const toolName = block.name.trim().toLowerCase();
             const toolArgs = block.input as Record<string, string | number | boolean | undefined>;
             const firstVal = Object.values(toolArgs)[0];
             const argPreview = String(firstVal ?? "").slice(0, 100) || "—";

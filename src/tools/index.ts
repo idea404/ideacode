@@ -51,13 +51,18 @@ function getTools(): Record<string, ToolDef> {
   return rest;
 }
 
+function normalizeToolName(name: string): string {
+  return name.trim().toLowerCase();
+}
+
 export async function runTool(name: string, args: ToolArgs): Promise<string> {
-  if (name === "web_search" && !getBraveSearchApiKey()) {
+  const canonical = normalizeToolName(name);
+  if (canonical === "web_search" && !getBraveSearchApiKey()) {
     return "error: Brave Search API key not set. Use /brave or set BRAVE_API_KEY to enable web search.";
   }
   const tools = getTools();
-  const def = tools[name];
-  if (!def) return `error: Unknown tool: ${name}`;
+  const def = tools[canonical];
+  if (!def) return `error: Unknown tool: ${canonical}`;
   try {
     const result = await def[2](args);
     return result;
