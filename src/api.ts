@@ -29,6 +29,13 @@ export async function fetchModels(apiKey: string): Promise<OpenRouterModel[]> {
   return json.data ?? [];
 }
 
+const MAX_RETRIES = 3;
+const INITIAL_BACKOFF_MS = 1000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export async function callApi(
   apiKey: string,
   messages: Array<{ role: string; content: unknown }>,
@@ -42,16 +49,30 @@ export async function callApi(
     messages,
     tools: makeSchema(),
   };
-  const res = await fetch(config.apiUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`);
-  return res.json();
+  let lastError: Error | null = null;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const res = await fetch(config.apiUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(body),
+    });
+    if (res.ok) return res.json();
+    const text = await res.text();
+    lastError = new Error(`API ${res.status}: ${text}`);
+    if ((res.status === 429 || res.status === 503) && attempt < MAX_RETRIES) {
+      const retryAfter = res.headers.get("retry-after");
+      const waitMs = retryAfter
+        ? Math.max(1000, parseInt(retryAfter, 10) * 1000)
+        : INITIAL_BACKOFF_MS * Math.pow(2, attempt);
+      await sleep(waitMs);
+      continue;
+    }
+    throw lastError;
+  }
+  throw lastError;
 }
 
 export type StreamCallbacks = {
@@ -211,17 +232,33 @@ export async function callSummarize(
     system: SUMMARIZE_SYSTEM,
     messages,
   };
-  const res = await fetch(config.apiUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw new Error(`Summarize API ${res.status}: ${await res.text()}`);
-  const data = (await res.json()) as { content?: ContentBlock[] };
-  const blocks = data.content ?? [];
-  const textBlock = blocks.find((b) => b.type === "text" && b.text);
-  return (textBlock?.text ?? "").trim();
+  let lastError: Error | null = null;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const res = await fetch(config.apiUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(body),
+    });
+    if (res.ok) {
+      const data = (await res.json()) as { content?: ContentBlock[] };
+      const blocks = data.content ?? [];
+      const textBlock = blocks.find((b) => b.type === "text" && b.text);
+      return (textBlock?.text ?? "").trim();
+    }
+    const text = await res.text();
+    lastError = new Error(`Summarize API ${res.status}: ${text}`);
+    if ((res.status === 429 || res.status === 503) && attempt < MAX_RETRIES) {
+      const retryAfter = res.headers.get("retry-after");
+      const waitMs = retryAfter
+        ? Math.max(1000, parseInt(retryAfter, 10) * 1000)
+        : INITIAL_BACKOFF_MS * Math.pow(2, attempt);
+      await sleep(waitMs);
+      continue;
+    }
+    throw lastError;
+  }
+  throw lastError;
 }

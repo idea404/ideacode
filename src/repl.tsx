@@ -596,6 +596,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
           await processInput(queued);
         }
       } catch (err) {
+        setLoading(false);
         appendLog(colors.error(`${icons.error} ${err instanceof Error ? err.message : String(err)}`));
         appendLog("");
       }
@@ -916,6 +917,9 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       }
       if (input === "?" && !inputValue.trim()) {
         setShowHelpModal(true);
+        return;
+      }
+      if (input === "[I" || input === "[O") {
         return;
       }
       if (input && !key.ctrl && !key.meta) {
