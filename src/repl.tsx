@@ -268,7 +268,16 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
   const queuedMessageRef = useRef<string | null>(null);
   const lastUserMessageRef = useRef<string>("");
   const [logScrollOffset, setLogScrollOffset] = useState(0);
+  const scrollBoundsRef = useRef({ maxLogScrollOffset: 0, logViewportHeight: 1 });
   const prevEscRef = useRef(false);
+
+  useEffect(() => {
+    process.stdout.write("\x1b[?1006h\x1b[?1000h");
+    return () => {
+      process.stdout.write("\x1b[?1006l\x1b[?1000l");
+    };
+  }, []);
+
   const [spinnerTick, setSpinnerTick] = useState(0);
   const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -594,6 +603,20 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
   );
 
   useInput((input, key) => {
+    if (typeof input === "string" && /\[<\d+;\d+;\d+[Mm]/.test(input)) {
+      const isWheelUp = input.includes("<64;");
+      const isWheelDown = input.includes("<65;");
+      if (isWheelUp || isWheelDown) {
+        const step = 3;
+        const { maxLogScrollOffset: maxOff } = scrollBoundsRef.current;
+        if (isWheelUp) {
+          setLogScrollOffset((prev) => Math.min(maxOff, prev + step));
+        } else {
+          setLogScrollOffset((prev) => Math.max(0, prev - step));
+        }
+      }
+      return;
+    }
     if (showHelpModal) {
       setShowHelpModal(false);
       return;
@@ -971,11 +994,19 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
   const logViewportHeight = Math.max(1, termRows - reservedLines - suggestionBoxLines);
   const effectiveLogLines = logLines;
   const maxLogScrollOffset = Math.max(0, effectiveLogLines.length - logViewportHeight);
-  const logStartIndex = Math.max(
+  scrollBoundsRef.current = { maxLogScrollOffset, logViewportHeight };
+  let logStartIndex = Math.max(
     0,
     effectiveLogLines.length - logViewportHeight - Math.min(logScrollOffset, maxLogScrollOffset)
   );
-  const visibleLogLines = effectiveLogLines.slice(logStartIndex, logStartIndex + logViewportHeight);
+  if (logScrollOffset >= maxLogScrollOffset - 1 && maxLogScrollOffset > 0) {
+    logStartIndex = 0;
+  }
+  const sliceEnd = logStartIndex + logViewportHeight;
+  const visibleLogLines =
+    logStartIndex === 0 && effectiveLogLines.length > 0
+      ? ["", ...effectiveLogLines.slice(0, logViewportHeight - 1)]
+      : effectiveLogLines.slice(logStartIndex, sliceEnd);
 
   if (showHelpModal) {
     const helpModalWidth = 56;
@@ -1014,7 +1045,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
             </Box>
             <Box marginTop={1}>
               <Text color={inkColors.primary}> Scroll </Text>
-              <Text color="gray"> ↑/↓ when input empty, or Ctrl/Opt+↑/↓ to scroll chat. </Text>
+              <Text color="gray"> Trackpad/↑/↓ scroll. To select text: hold Option (iTerm2) or Fn (Terminal.app) or Shift (Windows/Linux). </Text>
             </Box>
             <Box marginTop={1}>
               <Text color="gray"> Press any key to close </Text>
@@ -1165,7 +1196,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
           {icons.tool} {tokenDisplay}
         </Text>
         <Text color="gray" dimColor>
-          {`  ·  / ! @  ↑/↓ scroll (when input empty) or Ctrl/Opt+↑/↓  Ctrl+J newline  Tab queue  Esc Esc edit  ${pasteShortcut} paste  Ctrl+C exit`}
+          {`  ·  / ! @  trackpad/↑/↓ scroll  Opt/Fn+select  Ctrl+J newline  Tab queue  Esc Esc edit  ${pasteShortcut} paste  Ctrl+C exit`}
         </Text>
       </Box>
       <Box flexDirection="column" marginTop={0}>
