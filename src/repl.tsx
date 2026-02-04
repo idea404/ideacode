@@ -38,6 +38,7 @@ function wordStartBackward(value: string, cursor: number): number {
 
 function wordEndForward(value: string, cursor: number): number {
   let i = cursor;
+  while (i < value.length && !/[\w]/.test(value[i]!)) i++;
   while (i < value.length && /[\w]/.test(value[i]!)) i++;
   return i;
 }
@@ -858,6 +859,16 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         setInputCursor(wordEndForward(inputValue, cur));
         return;
       }
+      if (key.meta && (input === "b" || input === "f")) {
+        if (input === "b") setInputCursor(wordStartBackward(inputValue, cur));
+        else setInputCursor(wordEndForward(inputValue, cur));
+        return;
+      }
+      if (key.ctrl && (input === "f" || input === "b")) {
+        if (input === "f") setInputCursor(Math.min(len, cur + 1));
+        else setInputCursor(Math.max(0, cur - 1));
+        return;
+      }
       if (key.ctrl && input === "j") {
         setInputValue((prev) => prev.slice(0, cur) + "\n" + prev.slice(cur));
         setInputCursor(cur + 1);
@@ -1009,9 +1020,12 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       : effectiveLogLines.slice(logStartIndex, sliceEnd);
 
   if (showHelpModal) {
-    const helpModalWidth = 56;
-    const helpTopPad = Math.max(0, Math.floor((termRows - 20) / 2));
+    const helpModalWidth = Math.min(88, Math.max(80, termColumns - 4));
+    const helpContentRows = 20;
+    const helpTopPad = Math.max(0, Math.floor((termRows - helpContentRows) / 2));
     const helpLeftPad = Math.max(0, Math.floor((termColumns - helpModalWidth) / 2));
+    const labelWidth = 20;
+    const descWidth = helpModalWidth - (2 * 2) - labelWidth - 2;
     return (
       <Box flexDirection="column" height={termRows} overflow="hidden">
         <Box height={helpTopPad} />
@@ -1027,25 +1041,53 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
           >
             <Text bold> Help </Text>
             <Text color="gray"> What you can do </Text>
-            <Box marginTop={1}>
-              <Text color={inkColors.primary}> Message </Text>
-              <Text color="gray"> Type and Enter to send to the agent. </Text>
+            <Box marginTop={1} flexDirection="row" alignItems="flex-start">
+              <Box width={labelWidth} flexShrink={0}>
+                <Text color={inkColors.primary}> Message </Text>
+              </Box>
+              <Box width={descWidth} flexGrow={0}>
+                <Text color="gray"> Type and Enter to send to the agent. </Text>
+              </Box>
             </Box>
-            <Box marginTop={1}>
-              <Text color={inkColors.primary}> / </Text>
-              <Text color="gray"> Commands. Type / then pick: /models, /brave, /help, /clear, /status, /q. Ctrl+P palette. </Text>
+            <Box marginTop={1} flexDirection="row" alignItems="flex-start">
+              <Box width={labelWidth} flexShrink={0}>
+                <Text color={inkColors.primary}> / </Text>
+              </Box>
+              <Box width={descWidth} flexGrow={0}>
+                <Text color="gray"> Commands. Type / then pick: /models, /brave, /help, /clear, /status, /q. Ctrl+P palette. </Text>
+              </Box>
             </Box>
-            <Box marginTop={1}>
-              <Text color={inkColors.primary}> @ </Text>
-              <Text color="gray"> Attach files. Type @ then path; Tab to complete. </Text>
+            <Box marginTop={1} flexDirection="row" alignItems="flex-start">
+              <Box width={labelWidth} flexShrink={0}>
+                <Text color={inkColors.primary}> @ </Text>
+              </Box>
+              <Box width={descWidth} flexGrow={0}>
+                <Text color="gray"> Attach files. Type @ then path; Tab to complete. </Text>
+              </Box>
             </Box>
-            <Box marginTop={1}>
-              <Text color={inkColors.primary}> ! </Text>
-              <Text color="gray"> Run a shell command. Type ! then the command. </Text>
+            <Box marginTop={1} flexDirection="row" alignItems="flex-start">
+              <Box width={labelWidth} flexShrink={0}>
+                <Text color={inkColors.primary}> ! </Text>
+              </Box>
+              <Box width={descWidth} flexGrow={0}>
+                <Text color="gray"> Run a shell command. Type ! then the command. </Text>
+              </Box>
             </Box>
-            <Box marginTop={1}>
-              <Text color={inkColors.primary}> Scroll </Text>
-              <Text color="gray"> Trackpad/↑/↓ scroll. To select text: hold Option (iTerm2) or Fn (Terminal.app) or Shift (Windows/Linux). </Text>
+            <Box marginTop={1} flexDirection="row" alignItems="flex-start">
+              <Box width={labelWidth} flexShrink={0}>
+                <Text color={inkColors.primary}> Word / char nav </Text>
+              </Box>
+              <Box width={descWidth} flexGrow={0}>
+                <Text color="gray"> Ctrl+←/→ or Meta+←/→ word; Ctrl+F/B char (Emacs). Opt+←/→ needs terminal to send Meta (e.g. iTerm2: Esc+). </Text>
+              </Box>
+            </Box>
+            <Box marginTop={1} flexDirection="row" alignItems="flex-start">
+              <Box width={labelWidth} flexShrink={0}>
+                <Text color={inkColors.primary}> Scroll </Text>
+              </Box>
+              <Box width={descWidth} flexGrow={0}>
+                <Text color="gray"> Trackpad/↑/↓ scroll. To select text: hold Option (iTerm2) or Fn (Terminal.app) or Shift (Windows/Linux). </Text>
+              </Box>
             </Box>
             <Box marginTop={1}>
               <Text color="gray"> Press any key to close </Text>
