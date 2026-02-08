@@ -66,7 +66,7 @@ const THEME_DARK: ThemeConfig = {
     error: { main: "#f87171", dim: "#dc2626" },
     muted: { main: "#8a9a7a", dim: "#6a7a5a", dark: "#4a5a3a" },
     background: { dark: "#1a1a1a", darker: "#0f0f0f" },
-    text: { primary: "#e2e8f0", secondary: "#94a3b8", disabled: "#64748b" },
+    text: { primary: "#e2e8f0", secondary: "#98a08f", disabled: "#6f7867" },
   },
   ui: {
     borderColor: "#7F9A65",
@@ -96,7 +96,7 @@ const THEME_LIGHT: ThemeConfig = {
     error: { main: "#dc2626", dim: "#b91c1c" },
     muted: { main: "#6b7a5a", dim: "#5a6a4a", dark: "#4a5a3a" },
     background: { dark: "#f1f5f9", darker: "#e2e8f0" },
-    text: { primary: "#1e293b", secondary: "#475569", disabled: "#64748b" },
+    text: { primary: "#1e293b", secondary: "#5f6758", disabled: "#778070" },
   },
   ui: {
     borderColor: "#5a7247",

@@ -47,6 +47,12 @@ const CONTEXT_WINDOW_K = 128;
 const MAX_TOOL_RESULT_CHARS = 3500;
 const MAX_AT_SUGGESTIONS = 12;
 const INITIAL_BANNER_LINES = 12;
+const ENABLE_PARALLEL_TOOL_CALLS = process.env.IDEACODE_PARALLEL_TOOL_CALLS !== "0";
+const PARALLEL_SAFE_TOOLS = new Set(["read", "glob", "grep", "web_fetch", "web_search"]);
+const LOADING_TICK_MS = Math.min(
+  300,
+  Math.max(80, Number.parseInt(process.env.IDEACODE_SPINNER_MS ?? "110", 10) || 110)
+);
 
 const TRUNCATE_NOTE =
   "\n\n(Output truncated to save context. Use read with offset/limit, grep with a specific pattern, or tail with fewer lines to get more.)";
@@ -72,6 +78,12 @@ function listFilesWithFilter(cwd: string, filter: string): string[] {
 }
 
 type InputSegment = { type: "normal" | "path"; text: string };
+type PlannedToolCall = {
+  block: ContentBlock;
+  toolName: string;
+  toolArgs: Record<string, string | number | boolean | undefined>;
+  argPreview: string;
+};
 
 function parseAtSegments(value: string): InputSegment[] {
   const segments: InputSegment[] = [];
@@ -105,12 +117,19 @@ function wrapLine(line: string, width: number): string[] {
 function replayMessagesToLogLines(
   messages: Array<{ role: string; content: unknown }>
 ): string[] {
+  const sanitizePrompt = (value: string): string =>
+    value
+      .replace(/\x1b\[[0-9;]*m/g, "")
+      .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
+      .trim();
   const lines: string[] = [];
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i]!;
     if (msg.role === "user") {
       if (typeof msg.content === "string") {
-        lines.push("", ...userPromptBox(msg.content).split("\n"), "");
+        const prompt = sanitizePrompt(msg.content);
+        if (!prompt) continue;
+        lines.push("", ...userPromptBox(prompt).split("\n"), "");
       } else if (Array.isArray(msg.content)) {
         const prev = messages[i - 1];
         const toolResults = msg.content as Array<{ tool_use_id?: string; content?: string }>;
@@ -126,8 +145,6 @@ function replayMessagesToLogLines(
               const content = tr.content ?? "";
               const ok = !content.startsWith("error:");
               lines.push(toolCallBox(name, argPreview, ok));
-              const preview = content.split("\n")[0]?.slice(0, 60) ?? "";
-              lines.push(toolResultLine(preview, ok));
               const tokens = estimateTokensForString(content);
               lines.push(toolResultTokenLine(tokens, ok));
             }
@@ -280,7 +297,8 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
   }, []);
 
   const [spinnerTick, setSpinnerTick] = useState(0);
-  const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+  const loadingStartedAtRef = useRef<number>(0);
+  const SPINNER = ["●○○", "○●○", "○○●", "○●○"];
 
   const estimatedTokens = useMemo(() => estimateTokens(messages, undefined), [messages]);
   const contextWindowK = useMemo(() => {
@@ -321,7 +339,9 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
 
   useEffect(() => {
     if (!loading) return;
-    const t = setInterval(() => setSpinnerTick((n) => n + 1), 80);
+    loadingStartedAtRef.current = Date.now();
+    setSpinnerTick(0);
+    const t = setInterval(() => setSpinnerTick((n) => n + 1), LOADING_TICK_MS);
     return () => clearInterval(t);
   }, [loading]);
 
@@ -496,7 +516,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       appendLog("");
 
       let state: Array<{ role: string; content: unknown }> = [...messages, { role: "user", content: userInput }];
-      const systemPrompt = `Concise coding assistant. cwd: ${cwd}. PRIORITIZE grep to locate; then read with offset and limit to fetch only relevant sections. Do not read whole files unless the user explicitly asks. Use focused greps (specific patterns, narrow paths) and read in chunks when files are large; avoid one huge grep or read that floods context. When exploring a dependency, set path to that package (e.g. node_modules/<pkg>) and list/read only what you need. Prefer grep or keyword search for the most recent or specific occurrence; avoid tail/read of thousands of lines. If a tool result says it was truncated, call the tool again with offset, limit, or a narrower pattern to get what you need.`;
+      const systemPrompt = `Concise coding assistant. cwd: ${cwd}. PRIORITIZE grep to locate; then read with offset and limit to fetch only relevant sections. Do not read whole files unless the user explicitly asks. Use focused greps (specific patterns, narrow paths) and read in chunks when files are large; avoid one huge grep or read that floods context. When exploring a dependency, set path to that package (e.g. node_modules/<pkg>) and list/read only what you need. Prefer grep or keyword search for the most recent or specific occurrence; avoid tail/read of thousands of lines. If a tool result says it was truncated, call the tool again with offset, limit, or a narrower pattern to get what you need. Use as many parallel read/search/web tool calls as needed in one turn when they are independent (often more than 3 is appropriate for broad research), but keep each call high-signal, non-redundant, and minimal in output size.`;
 
       const modelContext = modelList.find((m) => m.id === currentModel)?.context_length;
       const maxContextTokens = Math.floor((modelContext ?? CONTEXT_WINDOW_K * 1024) * 0.85);
@@ -515,31 +535,75 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         const response = await callApi(apiKey, state, systemPrompt, currentModel);
         const contentBlocks = response.content ?? [];
         const toolResults: Array<{ type: string; tool_use_id: string; content: string }> = [];
+        const renderToolOutcome = (
+          planned: PlannedToolCall,
+          result: string,
+          extraIndent = 0
+        ): void => {
+          const ok = !result.startsWith("error:");
+          appendLog(toolCallBox(planned.toolName, planned.argPreview, ok, extraIndent));
+          const contentForApi = truncateToolResult(result);
+          const tokens = estimateTokensForString(contentForApi);
+          appendLog(toolResultTokenLine(tokens, ok, extraIndent));
+          if (planned.block.id) {
+            toolResults.push({ type: "tool_result", tool_use_id: planned.block.id, content: contentForApi });
+          }
+        };
 
+        const runParallelBatch = async (batch: PlannedToolCall[]): Promise<void> => {
+          if (batch.length === 0) return;
+          const started = Date.now();
+          const groupedTools = Array.from(
+            batch.reduce((acc, planned) => {
+              acc.set(planned.toolName, (acc.get(planned.toolName) ?? 0) + 1);
+              return acc;
+            }, new Map<string, number>())
+          )
+            .map(([name, count]) => (count > 1 ? `${name}×${count}` : name))
+            .join(", ");
+          appendLog(
+            colors.gray(`  ${icons.tool} parallel batch (${batch.length}): ${groupedTools}`)
+          );
+          const settled = await Promise.all(
+            batch.map(async (planned) => ({ planned, result: await runTool(planned.toolName, planned.toolArgs) }))
+          );
+          const elapsed = Date.now() - started;
+          appendLog(colors.gray(`    completed in ${elapsed}ms`));
+          for (const { planned, result } of settled) {
+            renderToolOutcome(planned, result, 1);
+          }
+        };
+
+        let parallelBatch: PlannedToolCall[] = [];
         for (const block of contentBlocks) {
           if (block.type === "text" && block.text?.trim()) {
             if (lastLogLineRef.current !== "") appendLog("");
             appendLog(agentMessage(block.text).trimEnd());
+            continue;
           }
-          if (block.type === "tool_use" && block.name && block.input) {
-            const toolName = block.name.trim().toLowerCase();
-            const toolArgs = block.input as Record<string, string | number | boolean | undefined>;
-            const firstVal = Object.values(toolArgs)[0];
-            const argPreview = String(firstVal ?? "").slice(0, 100) || "—";
-            const result = await runTool(toolName, toolArgs);
-            const ok = !result.startsWith("error:");
-            appendLog(toolCallBox(toolName, argPreview, ok));
-            const resultLines = result.split("\n");
-            let preview = resultLines[0]?.slice(0, 80) ?? "";
-            if (resultLines.length > 1) preview += ` ... +${resultLines.length - 1} lines`;
-            else if (preview.length > 80) preview += "...";
-            appendLog(toolResultLine(preview, ok));
-            const contentForApi = truncateToolResult(result);
-            const tokens = estimateTokensForString(contentForApi);
-            appendLog(toolResultTokenLine(tokens, ok));
-            if (block.id) toolResults.push({ type: "tool_result", tool_use_id: block.id, content: contentForApi });
+          if (block.type !== "tool_use" || !block.name || !block.input) continue;
+
+          const toolName = block.name.trim().toLowerCase();
+          const toolArgs = block.input as Record<string, string | number | boolean | undefined>;
+          const firstVal = Object.values(toolArgs)[0];
+          const planned: PlannedToolCall = {
+            block,
+            toolName,
+            toolArgs,
+            argPreview: String(firstVal ?? "").slice(0, 100) || "—",
+          };
+
+          if (ENABLE_PARALLEL_TOOL_CALLS && PARALLEL_SAFE_TOOLS.has(toolName)) {
+            parallelBatch.push(planned);
+            continue;
           }
+
+          await runParallelBatch(parallelBatch);
+          parallelBatch = [];
+          const result = await runTool(planned.toolName, planned.toolArgs);
+          renderToolOutcome(planned, result);
         }
+        await runParallelBatch(parallelBatch);
 
         setLoading(false);
 
@@ -961,16 +1025,16 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
           >
             <Text bold> Select model </Text>
             <Box flexDirection="row">
-              <Text color="gray"> Filter: </Text>
+              <Text color={inkColors.textSecondary}> Filter: </Text>
               <Text>{modelSearchFilter || " "}</Text>
               {modelSearchFilter.length > 0 && (
-                <Text dimColor color="gray">
+                <Text color={inkColors.textDisabled}>
                   {" "}({filteredModelList.length} match{filteredModelList.length !== 1 ? "es" : ""})
                 </Text>
               )}
             </Box>
             {visibleModels.length === 0 ? (
-              <Text color="gray"> No match — type to search by id or name </Text>
+              <Text color={inkColors.textSecondary}> No match — type to search by id or name </Text>
             ) : (
               visibleModels.map((m, i) => {
                 const actualIndex = modelScrollOffset + i;
@@ -982,7 +1046,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
                 );
               })
             )}
-            <Text color="gray"> ↑/↓ select  Enter confirm  Esc cancel  Type to filter </Text>
+            <Text color={inkColors.textSecondary}> ↑/↓ select  Enter confirm  Esc cancel  Type to filter </Text>
           </Box>
         </Box>
         <Box flexGrow={1} />
@@ -1005,7 +1069,8 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       0
     );
   })();
-  const reservedLines = 1 + inputLineCount + (loading ? 2 : 1);
+  // Keep a fixed loading row reserved to avoid viewport jumps/flicker when loading starts/stops.
+  const reservedLines = 1 + inputLineCount + 2;
   const logViewportHeight = Math.max(1, termRows - reservedLines - suggestionBoxLines);
   const effectiveLogLines = logLines;
   const maxLogScrollOffset = Math.max(0, effectiveLogLines.length - logViewportHeight);
@@ -1018,10 +1083,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
     logStartIndex = 0;
   }
   const sliceEnd = logStartIndex + logViewportHeight;
-  const visibleLogLines =
-    logStartIndex === 0 && effectiveLogLines.length > 0
-      ? ["", ...effectiveLogLines.slice(0, logViewportHeight - 1)]
-      : effectiveLogLines.slice(logStartIndex, sliceEnd);
+  const visibleLogLines = effectiveLogLines.slice(logStartIndex, sliceEnd);
 
   if (showHelpModal) {
     const helpModalWidth = Math.min(88, Math.max(80, termColumns - 4));
@@ -1044,13 +1106,13 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
             width={helpModalWidth}
           >
             <Text bold> Help </Text>
-            <Text color="gray"> What you can do </Text>
+            <Text color={inkColors.textSecondary}> What you can do </Text>
             <Box marginTop={1} flexDirection="row" alignItems="flex-start">
               <Box width={labelWidth} flexShrink={0}>
                 <Text color={inkColors.primary}> Message </Text>
               </Box>
               <Box width={descWidth} flexGrow={0}>
-                <Text color="gray"> Type and Enter to send to the agent. </Text>
+                <Text color={inkColors.textSecondary}> Type and Enter to send to the agent. </Text>
               </Box>
             </Box>
             <Box marginTop={1} flexDirection="row" alignItems="flex-start">
@@ -1058,7 +1120,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
                 <Text color={inkColors.primary}> / </Text>
               </Box>
               <Box width={descWidth} flexGrow={0}>
-                <Text color="gray"> Commands. Type / then pick: /models, /brave, /help, /clear, /status, /q. Ctrl+P palette. </Text>
+                <Text color={inkColors.textSecondary}> Commands. Type / then pick: /models, /brave, /help, /clear, /status, /q. Ctrl+P palette. </Text>
               </Box>
             </Box>
             <Box marginTop={1} flexDirection="row" alignItems="flex-start">
@@ -1066,7 +1128,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
                 <Text color={inkColors.primary}> @ </Text>
               </Box>
               <Box width={descWidth} flexGrow={0}>
-                <Text color="gray"> Attach files. Type @ then path; Tab to complete. </Text>
+                <Text color={inkColors.textSecondary}> Attach files. Type @ then path; Tab to complete. </Text>
               </Box>
             </Box>
             <Box marginTop={1} flexDirection="row" alignItems="flex-start">
@@ -1074,7 +1136,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
                 <Text color={inkColors.primary}> ! </Text>
               </Box>
               <Box width={descWidth} flexGrow={0}>
-                <Text color="gray"> Run a shell command. Type ! then the command. </Text>
+                <Text color={inkColors.textSecondary}> Run a shell command. Type ! then the command. </Text>
               </Box>
             </Box>
             <Box marginTop={1} flexDirection="row" alignItems="flex-start">
@@ -1082,7 +1144,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
                 <Text color={inkColors.primary}> Word / char nav </Text>
               </Box>
               <Box width={descWidth} flexGrow={0}>
-                <Text color="gray"> Ctrl+←/→ or Meta+←/→ word; Ctrl+F/B char (Emacs). Opt+←/→ needs terminal to send Meta (e.g. iTerm2: Esc+). </Text>
+                <Text color={inkColors.textSecondary}> Ctrl+←/→ or Meta+←/→ word; Ctrl+F/B char (Emacs). Opt+←/→ needs terminal to send Meta (e.g. iTerm2: Esc+). </Text>
               </Box>
             </Box>
             <Box marginTop={1} flexDirection="row" alignItems="flex-start">
@@ -1090,11 +1152,11 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
                 <Text color={inkColors.primary}> Scroll </Text>
               </Box>
               <Box width={descWidth} flexGrow={0}>
-                <Text color="gray"> Trackpad/↑/↓ scroll. To select text: hold Option (iTerm2) or Fn (Terminal.app) or Shift (Windows/Linux). </Text>
+                <Text color={inkColors.textSecondary}> Trackpad/↑/↓ scroll. To select text: hold Option (iTerm2) or Fn (Terminal.app) or Shift (Windows/Linux). </Text>
               </Box>
             </Box>
             <Box marginTop={1}>
-              <Text color="gray"> Press any key to close </Text>
+              <Text color={inkColors.textSecondary}> Press any key to close </Text>
             </Box>
           </Box>
         </Box>
@@ -1121,15 +1183,15 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
             width={braveModalWidth}
           >
             <Text bold> Brave Search API key </Text>
-            <Text color="gray"> Get one at https://brave.com/search/api </Text>
+            <Text color={inkColors.textSecondary}> Get one at https://brave.com/search/api </Text>
             {braveKeyInput === BRAVE_KEY_PLACEHOLDER && (
-              <Text color="gray"> Key already set. Type or paste to replace. </Text>
+              <Text color={inkColors.textSecondary}> Key already set. Type or paste to replace. </Text>
             )}
             <Box flexDirection="row" marginTop={1}>
               <Text color={inkColors.primary}> Key: </Text>
               <Text>{braveKeyInput || "\u00A0"}</Text>
             </Box>
-            <Text color="gray"> Enter to save, Esc to cancel </Text>
+            <Text color={inkColors.textSecondary}> Enter to save, Esc to cancel </Text>
           </Box>
         </Box>
         <Box flexGrow={1} />
@@ -1161,14 +1223,14 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
               <Text key={c.cmd} color={i === paletteIndex ? inkColors.primary : undefined}>
                 {i === paletteIndex ? "› " : "  "}
                 {c.cmd}
-                <Text color="gray"> — {c.desc}</Text>
+                <Text color={inkColors.textSecondary}> — {c.desc}</Text>
               </Text>
             ))}
             <Text color={paletteIndex === COMMANDS.length ? inkColors.primary : undefined}>
               {paletteIndex === COMMANDS.length ? "› " : "  "}
               Cancel (Esc)
             </Text>
-            <Text color="gray"> ↑/↓ select, Enter confirm, Esc close </Text>
+            <Text color={inkColors.textSecondary}> ↑/↓ select, Enter confirm, Esc close </Text>
           </Box>
         </Box>
         <Box flexGrow={1} />
@@ -1187,20 +1249,23 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
             </Text>
           ))}
         </Box>
-        {loading && (
-          <Box flexDirection="row" marginTop={1} marginBottom={0}>
-            <Text color="gray">
-              {" "}
-              {SPINNER[spinnerTick % SPINNER.length]} Thinking…
-            </Text>
-          </Box>
-        )}
+        <Box flexDirection="row" marginTop={1} marginBottom={0}>
+          <Text color={inkColors.textSecondary}>
+            {" "}
+            {loading
+              ? `${SPINNER[spinnerTick % SPINNER.length]} Thinking… ${(
+                  (Date.now() - loadingStartedAtRef.current) /
+                  1000
+                ).toFixed(1)}s`
+              : "\u00A0"}
+          </Text>
+        </Box>
       </Box>
       <Box flexDirection="column" flexShrink={0} height={footerLines}>
         {showSlashSuggestions && (
-          <Box flexDirection="column" marginBottom={0} paddingLeft={2} borderStyle="single" borderColor="gray">
+          <Box flexDirection="column" marginBottom={0} paddingLeft={2} borderStyle="single" borderColor={inkColors.textDisabled}>
             {filteredSlashCommands.length === 0 ? (
-              <Text color="gray"> No match </Text>
+              <Text color={inkColors.textSecondary}> No match </Text>
             ) : (
               [...filteredSlashCommands].reverse().map((c, rev) => {
                 const i = filteredSlashCommands.length - 1 - rev;
@@ -1208,18 +1273,18 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
                   <Text key={c.cmd} color={i === clampedSlashIndex ? inkColors.primary : undefined}>
                     {i === clampedSlashIndex ? "› " : "  "}
                     {c.cmd}
-                    <Text color="gray"> — {c.desc}</Text>
+                    <Text color={inkColors.textSecondary}> — {c.desc}</Text>
                   </Text>
                 );
               })
             )}
-            <Text color="gray"> Commands (↑/↓ select, Enter run, Esc clear) </Text>
+            <Text color={inkColors.textSecondary}> Commands (↑/↓ select, Enter run, Esc clear) </Text>
           </Box>
         )}
         {cursorInAtSegment && !showSlashSuggestions && (
-          <Box flexDirection="column" marginBottom={0} paddingLeft={2} borderStyle="single" borderColor="gray">
+          <Box flexDirection="column" marginBottom={0} paddingLeft={2} borderStyle="single" borderColor={inkColors.textDisabled}>
             {filteredFilePaths.length === 0 ? (
-              <Text color="gray"> {hasCharsAfterAt ? "No match" : "Type to search files"} </Text>
+              <Text color={inkColors.textSecondary}> {hasCharsAfterAt ? "No match" : "Type to search files"} </Text>
             ) : (
               [...filteredFilePaths].reverse().map((p, rev) => {
                 const i = filteredFilePaths.length - 1 - rev;
@@ -1232,16 +1297,16 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
               })
             )}
             <Box flexDirection="row" marginTop={1}>
-              <Text color="gray"> Files (↑/↓ select, Enter/Tab complete, Esc clear) </Text>
+              <Text color={inkColors.textSecondary}> Files (↑/↓ select, Enter/Tab complete, Esc clear) </Text>
             </Box>
           </Box>
         )}
       <Box flexDirection="row" marginTop={0}>
-        <Text color="gray" dimColor>
+        <Text color="gray">
           {" "}
           {icons.tool} {tokenDisplay}
         </Text>
-        <Text color="gray" dimColor>
+        <Text color="gray">
           {`  ·  / ! @  trackpad/↑/↓ scroll  Opt/Fn+select  Ctrl+J newline  Tab queue  Esc Esc edit  ${pasteShortcut} paste  Ctrl+C exit`}
         </Text>
       </Box>
@@ -1250,7 +1315,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
           <Box flexDirection="row">
             <Text color={inkColors.primary}>{icons.prompt} </Text>
             <Text inverse color={inkColors.primary}> </Text>
-            <Text color="gray">Message or / for commands, @ for files, ! for shell, ? for help...</Text>
+            <Text color={inkColors.textSecondary}>Message or / for commands, @ for files, ! for shell, ? for help...</Text>
           </Box>
         ) : (
           (() => {
@@ -1401,7 +1466,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
                         )}
                         {lineNodes}
                         {isLastLogicalLine && isLastVisualOfLine && inputValue.startsWith("!") && (
-                          <Text dimColor color="gray">
+                          <Text color={inkColors.textDisabled}>
                             {"  — "}type a shell command to run
                           </Text>
                         )}
