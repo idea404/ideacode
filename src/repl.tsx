@@ -62,6 +62,7 @@ const LOADING_TICK_MS = 80;
 const MAX_EMPTY_ASSISTANT_RETRIES = 3;
 const TYPING_LAYOUT_FREEZE_MS = 120;
 const INPUT_COMMIT_INTERVAL_MS = 45;
+const SLASH_SUGGESTION_ROWS = Math.max(1, COMMANDS.length);
 
 const TRUNCATE_NOTE =
   "\n\n(Output truncated to save context. Use read with offset/limit, grep with a specific pattern, or tail with fewer lines to get more.)";
@@ -1131,11 +1132,11 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
     }
     if (showSlashSuggestions && filteredSlashCommands.length > 0) {
       if (key.upArrow) {
-        setSlashSuggestionIndex((i) => Math.max(0, i - 1));
+        setSlashSuggestionIndex((i) => Math.min(filteredSlashCommands.length - 1, i + 1));
         return;
       }
       if (key.downArrow) {
-        setSlashSuggestionIndex((i) => Math.min(filteredSlashCommands.length - 1, i + 1));
+        setSlashSuggestionIndex((i) => Math.max(0, i - 1));
         return;
       }
       if (key.tab) {
@@ -1371,6 +1372,42 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
     }
   });
 
+  const slashSuggestionBoxLines = showSlashSuggestions
+    ? 3 + SLASH_SUGGESTION_ROWS
+    : 0;
+  const atSuggestionBoxLines = cursorInAtSegment
+    ? 4 + Math.max(1, filteredFilePaths.length)
+    : 0;
+  const suggestionBoxLines = slashSuggestionBoxLines || atSuggestionBoxLines;
+  // Keep a fixed loading row reserved to avoid viewport jumps/flicker when loading starts/stops.
+  const reservedLines = 1 + layoutInputLineCount + 2;
+  const logViewportHeight = Math.max(1, termRows - reservedLines - suggestionBoxLines);
+  const effectiveLogLines = logLines;
+  const maxLogScrollOffset = Math.max(0, effectiveLogLines.length - logViewportHeight);
+  scrollBoundsRef.current = { maxLogScrollOffset, logViewportHeight };
+  let logStartIndex = Math.max(
+    0,
+    effectiveLogLines.length - logViewportHeight - Math.min(logScrollOffset, maxLogScrollOffset)
+  );
+  if (logScrollOffset >= maxLogScrollOffset - 1 && maxLogScrollOffset > 0) {
+    logStartIndex = 0;
+  }
+  const sliceEnd = logStartIndex + logViewportHeight;
+  const visibleLogLines = useMemo(
+    () => effectiveLogLines.slice(logStartIndex, sliceEnd),
+    [effectiveLogLines, logStartIndex, sliceEnd]
+  );
+  const useSimpleInputRenderer = inputLineCount > 1;
+
+  const calculatedFooterLines = suggestionBoxLines + 1 + layoutInputLineCount;
+  useEffect(() => {
+    if (!isInputLayoutFrozen) {
+      setFrozenFooterLines(calculatedFooterLines);
+    }
+  }, [isInputLayoutFrozen, calculatedFooterLines]);
+  const footerLines = isInputLayoutFrozen ? frozenFooterLines : calculatedFooterLines;
+  loadingFooterLinesRef.current = footerLines;
+
   if (showModelSelector) {
     const modelModalMaxHeight = 18;
     const modelModalWidth = 108;
@@ -1424,33 +1461,6 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       </Box>
     );
   }
-
-  const slashSuggestionBoxLines = showSlashSuggestions
-    ? 3 + Math.max(1, filteredSlashCommands.length)
-    : 0;
-  const atSuggestionBoxLines = cursorInAtSegment
-    ? 4 + Math.max(1, filteredFilePaths.length)
-    : 0;
-  const suggestionBoxLines = slashSuggestionBoxLines || atSuggestionBoxLines;
-  // Keep a fixed loading row reserved to avoid viewport jumps/flicker when loading starts/stops.
-  const reservedLines = 1 + layoutInputLineCount + 2;
-  const logViewportHeight = Math.max(1, termRows - reservedLines - suggestionBoxLines);
-  const effectiveLogLines = logLines;
-  const maxLogScrollOffset = Math.max(0, effectiveLogLines.length - logViewportHeight);
-  scrollBoundsRef.current = { maxLogScrollOffset, logViewportHeight };
-  let logStartIndex = Math.max(
-    0,
-    effectiveLogLines.length - logViewportHeight - Math.min(logScrollOffset, maxLogScrollOffset)
-  );
-  if (logScrollOffset >= maxLogScrollOffset - 1 && maxLogScrollOffset > 0) {
-    logStartIndex = 0;
-  }
-  const sliceEnd = logStartIndex + logViewportHeight;
-  const visibleLogLines = useMemo(
-    () => effectiveLogLines.slice(logStartIndex, sliceEnd),
-    [effectiveLogLines, logStartIndex, sliceEnd]
-  );
-  const useSimpleInputRenderer = inputLineCount > 1;
 
   if (showHelpModal) {
     const helpModalWidth = Math.min(88, Math.max(80, termColumns - 4));
@@ -1605,14 +1615,6 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
     );
   }
 
-  const calculatedFooterLines = suggestionBoxLines + 1 + layoutInputLineCount;
-  useEffect(() => {
-    if (!isInputLayoutFrozen) {
-      setFrozenFooterLines(calculatedFooterLines);
-    }
-  }, [isInputLayoutFrozen, calculatedFooterLines]);
-  const footerLines = isInputLayoutFrozen ? frozenFooterLines : calculatedFooterLines;
-  loadingFooterLinesRef.current = footerLines;
   return (
     <Box flexDirection="column" height={termRows} overflow="hidden">
       <Box flexDirection="column" flexGrow={1} minHeight={0} overflow="hidden">
@@ -1623,12 +1625,19 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       </Box>
       <Box flexDirection="column" flexShrink={0} height={footerLines}>
         {showSlashSuggestions && (
-          <Box flexDirection="column" marginBottom={0} paddingLeft={2} borderStyle="single" borderColor={inkColors.textDisabled}>
+          <Box
+            flexDirection="column"
+            marginBottom={0}
+            paddingLeft={2}
+            borderStyle="single"
+            borderColor={inkColors.textDisabled}
+            height={slashSuggestionBoxLines}
+          >
             {filteredSlashCommands.length === 0 ? (
               <Text color={inkColors.textSecondary}> No match </Text>
             ) : (
-              [...filteredSlashCommands].reverse().map((c, rev) => {
-                const i = filteredSlashCommands.length - 1 - rev;
+              [...filteredSlashCommands.slice(0, SLASH_SUGGESTION_ROWS)].reverse().map((c, rev) => {
+                const i = Math.min(filteredSlashCommands.length, SLASH_SUGGESTION_ROWS) - 1 - rev;
                 return (
                   <Text key={c.cmd} color={i === clampedSlashIndex ? inkColors.primary : undefined}>
                     {i === clampedSlashIndex ? "› " : "  "}
@@ -1638,6 +1647,11 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
                 );
               })
             )}
+            {Array.from({
+              length: Math.max(0, SLASH_SUGGESTION_ROWS - Math.min(filteredSlashCommands.length, SLASH_SUGGESTION_ROWS)),
+            }).map((_, idx) => (
+              <Text key={`slash-pad-${idx}`}>{"\u00A0"}</Text>
+            ))}
             <Text color={inkColors.textSecondary}> Commands (↑/↓ select, Enter run, Esc clear) </Text>
           </Box>
         )}
@@ -1662,11 +1676,11 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
           </Box>
         )}
       <Box flexDirection="row" marginTop={0}>
-        <Text color={inkColors.mutedDark}>
+        <Text color={inkColors.footerHint}>
           {" "}
           {icons.tool} {tokenDisplay}
         </Text>
-        <Text color={inkColors.mutedDark}>
+        <Text color={inkColors.footerHint}>
           {`  ·  / ! @  trackpad/↑/↓ scroll  Ctrl+J newline  Tab queue  Esc Esc edit`}
         </Text>
       </Box>
