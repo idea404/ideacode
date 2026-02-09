@@ -60,7 +60,8 @@ const PARALLEL_SAFE_TOOLS = new Set([
 ]);
 const LOADING_TICK_MS = 80;
 const MAX_EMPTY_ASSISTANT_RETRIES = 3;
-const TYPING_LAYOUT_FREEZE_MS = 180;
+const TYPING_LAYOUT_FREEZE_MS = 120;
+const INPUT_COMMIT_INTERVAL_MS = 45;
 
 const TRUNCATE_NOTE =
   "\n\n(Output truncated to save context. Use read with offset/limit, grep with a specific pattern, or tail with fewer lines to get more.)";
@@ -69,8 +70,6 @@ function truncateToolResult(content: string): string {
   if (content.length <= MAX_TOOL_RESULT_CHARS) return content;
   return content.slice(0, MAX_TOOL_RESULT_CHARS) + TRUNCATE_NOTE;
 }
-const isMac = process.platform === "darwin";
-const pasteShortcut = isMac ? "Cmd+V" : "Ctrl+V";
 
 function listFilesWithFilter(cwd: string, filter: string): string[] {
   try {
@@ -459,6 +458,11 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
   const [showHelpModal, setShowHelpModal] = useState(false);
   const [slashSuggestionIndex, setSlashSuggestionIndex] = useState(0);
   const [inputCursor, setInputCursor] = useState(0);
+  const inputValueRef = useRef(inputValue);
+  const inputCursorRef = useRef(inputCursor);
+  const inputCommitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [layoutInputLineCount, setLayoutInputLineCount] = useState(1);
+  const shrinkLineTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [isInputLayoutFrozen, setIsInputLayoutFrozen] = useState(false);
   const [frozenFooterLines, setFrozenFooterLines] = useState(2);
   const skipNextSubmitRef = useRef(false);
@@ -467,7 +471,6 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
   const [logScrollOffset, setLogScrollOffset] = useState(0);
   const scrollBoundsRef = useRef({ maxLogScrollOffset: 0, logViewportHeight: 1 });
   const prevEscRef = useRef(false);
-  const inputChangeMountedRef = useRef(false);
   const typingFreezeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -554,23 +557,77 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       0
     );
   }, [inputValue, wrapWidth]);
-  const [stableInputLineCount, setStableInputLineCount] = useState(inputLineCount);
   useEffect(() => {
-    if (inputLineCount <= 1) {
-      setStableInputLineCount(1);
+    if (inputLineCount >= layoutInputLineCount) {
+      if (shrinkLineTimerRef.current) {
+        clearTimeout(shrinkLineTimerRef.current);
+        shrinkLineTimerRef.current = null;
+      }
+      setLayoutInputLineCount(inputLineCount);
       return;
     }
-    const t = setTimeout(() => setStableInputLineCount(inputLineCount), 90);
-    return () => clearTimeout(t);
-  }, [inputLineCount]);
+    if (shrinkLineTimerRef.current) {
+      clearTimeout(shrinkLineTimerRef.current);
+    }
+    shrinkLineTimerRef.current = setTimeout(() => {
+      setLayoutInputLineCount(inputLineCount);
+      shrinkLineTimerRef.current = null;
+    }, 120);
+    return () => {
+      if (shrinkLineTimerRef.current) {
+        clearTimeout(shrinkLineTimerRef.current);
+      }
+    };
+  }, [inputLineCount, layoutInputLineCount]);
+
+  useEffect(() => {
+    inputValueRef.current = inputValue;
+  }, [inputValue]);
+
+  useEffect(() => {
+    inputCursorRef.current = inputCursor;
+  }, [inputCursor]);
+
+  const commitInputState = useCallback((immediate = false) => {
+    const flush = () => {
+      inputCommitTimerRef.current = null;
+      setInputValue(inputValueRef.current);
+      setInputCursor(inputCursorRef.current);
+    };
+    if (immediate) {
+      if (inputCommitTimerRef.current) {
+        clearTimeout(inputCommitTimerRef.current);
+        inputCommitTimerRef.current = null;
+      }
+      flush();
+      return;
+    }
+    if (inputCommitTimerRef.current) return;
+    inputCommitTimerRef.current = setTimeout(flush, INPUT_COMMIT_INTERVAL_MS);
+  }, []);
+
+  const applyInputMutation = useCallback(
+    (nextValue: string, nextCursor: number, immediate = false) => {
+      inputValueRef.current = nextValue;
+      inputCursorRef.current = Math.max(0, Math.min(nextCursor, nextValue.length));
+      // Keep cursor/text rendering strictly in sync while typing.
+      void immediate;
+      commitInputState(true);
+    },
+    [commitInputState]
+  );
 
   useEffect(() => {
     setInputCursor((c) => Math.min(c, Math.max(0, inputValue.length)));
   }, [inputValue.length]);
 
   useEffect(() => {
-    if (!inputChangeMountedRef.current) {
-      inputChangeMountedRef.current = true;
+    if (inputLineCount > layoutInputLineCount) {
+      setIsInputLayoutFrozen(false);
+      if (typingFreezeTimerRef.current) {
+        clearTimeout(typingFreezeTimerRef.current);
+        typingFreezeTimerRef.current = null;
+      }
       return;
     }
     setIsInputLayoutFrozen(true);
@@ -581,13 +638,21 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       setIsInputLayoutFrozen(false);
       typingFreezeTimerRef.current = null;
     }, TYPING_LAYOUT_FREEZE_MS);
-  }, [inputValue, inputCursor]);
+  }, [inputValue, inputCursor, inputLineCount, layoutInputLineCount]);
 
   useEffect(() => {
     return () => {
       if (typingFreezeTimerRef.current) {
         clearTimeout(typingFreezeTimerRef.current);
         typingFreezeTimerRef.current = null;
+      }
+      if (shrinkLineTimerRef.current) {
+        clearTimeout(shrinkLineTimerRef.current);
+        shrinkLineTimerRef.current = null;
+      }
+      if (inputCommitTimerRef.current) {
+        clearTimeout(inputCommitTimerRef.current);
+        inputCommitTimerRef.current = null;
       }
     };
   }, []);
@@ -1144,14 +1209,16 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         }
       }
     }
-    if (!showModelSelector && !showPalette) {
+      if (!showModelSelector && !showPalette) {
+      const inputNow = inputValueRef.current;
+      const cursorNow = inputCursorRef.current;
       const withModifier = key.ctrl || key.meta || key.shift;
       const scrollUp =
         key.pageUp ||
-        (key.upArrow && (withModifier || !inputValue.trim()));
+        (key.upArrow && (withModifier || !inputNow.trim()));
       const scrollDown =
         key.pageDown ||
-        (key.downArrow && (withModifier || !inputValue.trim()));
+        (key.downArrow && (withModifier || !inputNow.trim()));
       if (scrollUp) {
         setLogScrollOffset((prev) =>
           Math.min(maxLogScrollOffset, prev + logViewportHeight)
@@ -1163,51 +1230,47 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         return;
       }
       if (!key.escape) prevEscRef.current = false;
-      const len = inputValue.length;
-      const cur = inputCursor;
+      const len = inputNow.length;
+      const cur = cursorNow;
       if (key.tab) {
-        if (inputValue.trim()) {
-          queuedMessageRef.current = inputValue;
-          setInputValue("");
-          setInputCursor(0);
+        if (inputNow.trim()) {
+          queuedMessageRef.current = inputNow;
+          applyInputMutation("", 0, true);
           appendLog(colors.muted("  Message queued. Send to run after this turn."));
           appendLog("");
         }
         return;
       }
       if (key.escape) {
-        if (inputValue.length === 0) {
+        if (inputNow.length === 0) {
           if (prevEscRef.current) {
             prevEscRef.current = false;
             const last = lastUserMessageRef.current;
             if (last) {
-              setInputValue(last);
-              setInputCursor(last.length);
+              applyInputMutation(last, last.length, true);
               setMessages((prev) => (prev.length > 0 && prev[prev.length - 1]?.role === "user" ? prev.slice(0, -1) : prev));
               appendLog(colors.muted("  Editing previous message. Submit to replace."));
               appendLog("");
             }
           } else prevEscRef.current = true;
         } else {
-          setInputValue("");
-          setInputCursor(0);
+          applyInputMutation("", 0, true);
           prevEscRef.current = false;
         }
         return;
       }
       if (key.return) {
-        handleSubmit(inputValue);
-        setInputValue("");
-        setInputCursor(0);
+        commitInputState(true);
+        handleSubmit(inputValueRef.current);
+        applyInputMutation("", 0, true);
         return;
       }
       if (key.ctrl && input === "u") {
-        setInputValue((prev) => prev.slice(cur));
-        setInputCursor(0);
+        applyInputMutation(inputNow.slice(cur), 0);
         return;
       }
       if (key.ctrl && input === "k") {
-        setInputValue((prev) => prev.slice(0, cur));
+        applyInputMutation(inputNow.slice(0, cur), cur);
         return;
       }
       const killWordBefore =
@@ -1215,84 +1278,80 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         (key.meta && key.backspace) ||
         (key.meta && key.delete && cur > 0);
       if (killWordBefore) {
-        const start = wordStartBackward(inputValue, cur);
+        const start = wordStartBackward(inputNow, cur);
         if (start < cur) {
-          setInputValue((prev) => prev.slice(0, start) + prev.slice(cur));
-          setInputCursor(start);
+          applyInputMutation(inputNow.slice(0, start) + inputNow.slice(cur), start);
         }
         return;
       }
       if (key.meta && input === "d") {
-        const end = wordEndForward(inputValue, cur);
+        const end = wordEndForward(inputNow, cur);
         if (end > cur) {
-          setInputValue((prev) => prev.slice(0, cur) + prev.slice(end));
+          applyInputMutation(inputNow.slice(0, cur) + inputNow.slice(end), cur);
         }
         return;
       }
       if ((key.meta && key.leftArrow) || (key.ctrl && key.leftArrow)) {
-        setInputCursor(wordStartBackward(inputValue, cur));
+        applyInputMutation(inputNow, wordStartBackward(inputNow, cur));
         return;
       }
       if ((key.meta && key.rightArrow) || (key.ctrl && key.rightArrow)) {
-        setInputCursor(wordEndForward(inputValue, cur));
+        applyInputMutation(inputNow, wordEndForward(inputNow, cur));
         return;
       }
       if (key.meta && (input === "b" || input === "f")) {
-        if (input === "b") setInputCursor(wordStartBackward(inputValue, cur));
-        else setInputCursor(wordEndForward(inputValue, cur));
+        if (input === "b") applyInputMutation(inputNow, wordStartBackward(inputNow, cur));
+        else applyInputMutation(inputNow, wordEndForward(inputNow, cur));
         return;
       }
       if (key.ctrl && (input === "f" || input === "b")) {
-        if (input === "f") setInputCursor(Math.min(len, cur + 1));
-        else setInputCursor(Math.max(0, cur - 1));
+        if (input === "f") applyInputMutation(inputNow, Math.min(len, cur + 1));
+        else applyInputMutation(inputNow, Math.max(0, cur - 1));
         return;
       }
       if (key.ctrl && input === "j") {
-        setInputValue((prev) => prev.slice(0, cur) + "\n" + prev.slice(cur));
-        setInputCursor(cur + 1);
+        applyInputMutation(inputNow.slice(0, cur) + "\n" + inputNow.slice(cur), cur + 1);
         return;
       }
       if (key.ctrl && input === "a") {
-        setInputCursor(0);
+        applyInputMutation(inputNow, 0);
         return;
       }
       if (key.ctrl && input === "e") {
-        setInputCursor(len);
+        applyInputMutation(inputNow, len);
         return;
       }
       if (key.ctrl && input === "h") {
         if (cur > 0) {
-          setInputValue((prev) => prev.slice(0, cur - 1) + prev.slice(cur));
-          setInputCursor(cur - 1);
+          applyInputMutation(inputNow.slice(0, cur - 1) + inputNow.slice(cur), cur - 1);
         }
         return;
       }
       if (key.ctrl && input === "d") {
         if (cur < len) {
-          setInputValue((prev) => prev.slice(0, cur) + prev.slice(cur + 1));
+          applyInputMutation(inputNow.slice(0, cur) + inputNow.slice(cur + 1), cur);
         }
         return;
       }
       if (key.backspace || (key.delete && cur > 0)) {
         if (cur > 0) {
-          setInputValue((prev) => prev.slice(0, cur - 1) + prev.slice(cur));
-          setInputCursor(cur - 1);
+          applyInputMutation(inputNow.slice(0, cur - 1) + inputNow.slice(cur), cur - 1);
         }
         return;
       }
       if (key.delete && cur < len) {
-        setInputValue((prev) => prev.slice(0, cur) + prev.slice(cur + 1));
+        applyInputMutation(inputNow.slice(0, cur) + inputNow.slice(cur + 1), cur);
         return;
       }
       if (key.leftArrow) {
-        setInputCursor(Math.max(0, cur - 1));
+        applyInputMutation(inputNow, Math.max(0, cur - 1));
         return;
       }
       if (key.rightArrow) {
-        setInputCursor(Math.min(len, cur + 1));
+        applyInputMutation(inputNow, Math.min(len, cur + 1));
         return;
       }
-      if (input === "?" && !inputValue.trim()) {
+      if (input === "?" && !inputNow.trim()) {
         setShowHelpModal(true);
         return;
       }
@@ -1300,8 +1359,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         return;
       }
       if (input && !key.ctrl && !key.meta) {
-        setInputValue((prev) => prev.slice(0, cur) + input + prev.slice(cur));
-        setInputCursor(cur + input.length);
+        applyInputMutation(inputNow.slice(0, cur) + input + inputNow.slice(cur), cur + input.length);
         return;
       }
     }
@@ -1375,7 +1433,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
     : 0;
   const suggestionBoxLines = slashSuggestionBoxLines || atSuggestionBoxLines;
   // Keep a fixed loading row reserved to avoid viewport jumps/flicker when loading starts/stops.
-  const reservedLines = 1 + stableInputLineCount + 2;
+  const reservedLines = 1 + layoutInputLineCount + 2;
   const logViewportHeight = Math.max(1, termRows - reservedLines - suggestionBoxLines);
   const effectiveLogLines = logLines;
   const maxLogScrollOffset = Math.max(0, effectiveLogLines.length - logViewportHeight);
@@ -1547,7 +1605,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
     );
   }
 
-  const calculatedFooterLines = suggestionBoxLines + 1 + stableInputLineCount;
+  const calculatedFooterLines = suggestionBoxLines + 1 + layoutInputLineCount;
   useEffect(() => {
     if (!isInputLayoutFrozen) {
       setFrozenFooterLines(calculatedFooterLines);
@@ -1604,12 +1662,12 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
           </Box>
         )}
       <Box flexDirection="row" marginTop={0}>
-        <Text color="gray">
+        <Text color={inkColors.mutedDark}>
           {" "}
           {icons.tool} {tokenDisplay}
         </Text>
-        <Text color="gray">
-          {`  ·  / ! @  trackpad/↑/↓ scroll  Opt/Fn+select  Ctrl+J newline  Tab queue  Esc Esc edit  ${pasteShortcut} paste  Ctrl+C exit`}
+        <Text color={inkColors.mutedDark}>
+          {`  ·  / ! @  trackpad/↑/↓ scroll  Ctrl+J newline  Tab queue  Esc Esc edit`}
         </Text>
       </Box>
       <Box flexDirection="column" marginTop={0}>
