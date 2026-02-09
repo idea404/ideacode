@@ -127,6 +127,19 @@ function isDarkMode(): boolean {
   return n <= 7;
 }
 
+function hasTrueColor(): boolean {
+  const colorterm = (process.env.COLORTERM ?? "").toLowerCase();
+  if (colorterm.includes("truecolor") || colorterm.includes("24bit")) return true;
+  const term = (process.env.TERM ?? "").toLowerCase();
+  return term.includes("direct");
+}
+
+function resolveFooterHintColor(base: string): string {
+  const inTmux = Boolean(process.env.TMUX);
+  if (inTmux && !hasTrueColor()) return "#5a5a5a";
+  return base;
+}
+
 const theme: ThemeConfig = isDarkMode() ? THEME_DARK : THEME_LIGHT;
 
 export { theme };
@@ -172,7 +185,7 @@ export const inkColors = {
   textPrimary: theme.colors.text.primary,
   textSecondary: theme.colors.text.secondary,
   textDisabled: theme.colors.text.disabled,
-  footerHint: theme.colors.text.footerHint,
+  footerHint: resolveFooterHintColor(theme.colors.text.footerHint),
 } as const;
 
 export const icons = theme.icons;
