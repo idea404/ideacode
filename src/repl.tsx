@@ -49,7 +49,15 @@ const MAX_TOOL_RESULT_CHARS = 3500;
 const MAX_AT_SUGGESTIONS = 12;
 const INITIAL_BANNER_LINES = 12;
 const ENABLE_PARALLEL_TOOL_CALLS = process.env.IDEACODE_PARALLEL_TOOL_CALLS !== "0";
-const PARALLEL_SAFE_TOOLS = new Set(["read", "glob", "grep", "web_fetch", "web_search"]);
+const PARALLEL_SAFE_TOOLS = new Set([
+  "read",
+  "glob",
+  "grep",
+  "web_fetch",
+  "web_search",
+  "bash_status",
+  "bash_logs",
+]);
 const LOADING_TICK_MS = 80;
 const MAX_EMPTY_ASSISTANT_RETRIES = 3;
 
@@ -167,7 +175,7 @@ function toolArgPreview(
   toolName: string,
   toolArgs: Record<string, string | number | boolean | undefined>
 ): string {
-  if (toolName === "bash") {
+  if (toolName === "bash" || toolName === "bash_detach") {
     const cmd = String(toolArgs.cmd ?? "").trim();
     return cmd ? summarizeBashCommand(cmd) : "—";
   }
@@ -742,7 +750,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       appendLog("");
 
       let state: Array<{ role: string; content: unknown }> = [...messages, { role: "user", content: userInput }];
-      const systemPrompt = `Concise coding assistant. cwd: ${cwd}. PRIORITIZE grep to locate; then read with offset and limit to fetch only relevant sections. Do not read whole files unless the user explicitly asks. Use focused greps (specific patterns, narrow paths) and read in chunks when files are large; avoid one huge grep or read that floods context. When exploring a dependency, set path to that package (e.g. node_modules/<pkg>) and list/read only what you need. Prefer grep or keyword search for the most recent or specific occurrence; avoid tail/read of thousands of lines. If a tool result says it was truncated, call the tool again with offset, limit, or a narrower pattern to get what you need. Use as many parallel read/search/web tool calls as needed in one turn when they are independent (often more than 3 is appropriate for broad research), but keep each call high-signal, non-redundant, and minimal in output size. For bash tool calls, avoid decorative echo headers; run direct commands and keep commands concise.`;
+      const systemPrompt = `Concise coding assistant. cwd: ${cwd}. PRIORITIZE grep to locate; then read with offset and limit to fetch only relevant sections. Do not read whole files unless the user explicitly asks. Use focused greps (specific patterns, narrow paths) and read in chunks when files are large; avoid one huge grep or read that floods context. When exploring a dependency, set path to that package (e.g. node_modules/<pkg>) and list/read only what you need. Prefer grep or keyword search for the most recent or specific occurrence; avoid tail/read of thousands of lines. If a tool result says it was truncated, call the tool again with offset, limit, or a narrower pattern to get what you need. Use as many parallel read/search/web tool calls as needed in one turn when they are independent (often more than 3 is appropriate for broad research), but keep each call high-signal, non-redundant, and minimal in output size. For bash tool calls, avoid decorative echo headers; run direct commands and keep commands concise. For long-running commands, prefer bash_detach then poll with bash_status and bash_logs instead of blocking bash.`;
 
       const modelContext = modelList.find((m) => m.id === currentModel)?.context_length;
       const maxContextTokens = Math.floor((modelContext ?? CONTEXT_WINDOW_K * 1024) * 0.85);

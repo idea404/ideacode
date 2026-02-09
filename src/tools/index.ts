@@ -1,7 +1,7 @@
 import { getBraveSearchApiKey } from "../config.js";
 import { readFile, writeFile, editFile } from "./file.js";
 import { globFiles, grepFiles } from "./search.js";
-import { runBash } from "./bash.js";
+import { runBash, runBashDetach, runBashLogs, runBashStatus } from "./bash.js";
 import { webFetch, webSearch } from "./web.js";
 import type { ToolArgs, ToolDef } from "./types.js";
 
@@ -28,9 +28,24 @@ export const TOOLS: Record<string, ToolDef> = {
     grepFiles,
   ],
   bash: [
-    "Run shell command. Use for things the other tools don't cover (e.g. running tests, installs, one-off commands, ephemeral << PY scripts, etc.). Always avoid dump outputs. Prefer read/grep/glob for file content and search; use targeted commands and avoid dumping huge output.",
-    { cmd: "string" },
+    "Run shell command. Supports optional timeout_ms (default 30000). Use for things other tools don't cover. Prefer targeted commands and avoid huge outputs.",
+    { cmd: "string", timeout_ms: "number?" },
     runBash,
+  ],
+  bash_detach: [
+    "Start a long-running shell command in the background and return a job_id for later polling.",
+    { cmd: "string" },
+    runBashDetach,
+  ],
+  bash_status: [
+    "Check status of a detached bash job.",
+    { job_id: "string" },
+    runBashStatus,
+  ],
+  bash_logs: [
+    "Read recent log lines from a detached bash job.",
+    { job_id: "string", tail_lines: "number?" },
+    runBashLogs,
   ],
   web_fetch: [
     "Fetch a URL and return the main text content (handles JS-rendered pages). Use for docs, raw GitHub, any web page.",
