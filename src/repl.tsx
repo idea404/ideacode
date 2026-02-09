@@ -51,6 +51,7 @@ const INITIAL_BANNER_LINES = 12;
 const ENABLE_PARALLEL_TOOL_CALLS = process.env.IDEACODE_PARALLEL_TOOL_CALLS !== "0";
 const PARALLEL_SAFE_TOOLS = new Set(["read", "glob", "grep", "web_fetch", "web_search"]);
 const LOADING_TICK_MS = 80;
+const MAX_EMPTY_ASSISTANT_RETRIES = 3;
 
 const TRUNCATE_NOTE =
   "\n\n(Output truncated to save context. Use read with offset/limit, grep with a specific pattern, or tail with fewer lines to get more.)";
@@ -83,11 +84,58 @@ type PlannedToolCall = {
   argPreview: string;
 };
 
+function stripHeredocBodies(cmdRaw: string): string {
+  const lines = cmdRaw.replace(/\r\n/g, "\n").split("\n");
+  const out: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i] ?? "";
+    out.push(line);
+    const markerMatch = line.match(/<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/);
+    if (!markerMatch) {
+      i += 1;
+      continue;
+    }
+    const marker = markerMatch[2] ?? "";
+    i += 1;
+    while (i < lines.length) {
+      const bodyLine = lines[i] ?? "";
+      if (bodyLine.trim() === marker) {
+        out.push(bodyLine);
+        break;
+      }
+      i += 1;
+    }
+    i += 1;
+  }
+  return out.join("\n");
+}
+
 function summarizeBashCommand(cmdRaw: string): string {
-  const parts = cmdRaw
-    .split(/\n|&&|;|\|/g)
+  const sanitized = stripHeredocBodies(cmdRaw);
+  const parts = sanitized
+    .split(/\n|&&|\|\||;|\|/g)
     .map((s) => s.trim())
     .filter(Boolean);
+  const skipTokens = new Set([
+    "if",
+    "then",
+    "else",
+    "elif",
+    "fi",
+    "for",
+    "while",
+    "do",
+    "done",
+    "case",
+    "esac",
+    "in",
+    "function",
+    "{",
+    "}",
+    "(",
+    ")",
+  ]);
   const commands: string[] = [];
   for (const part of parts) {
     let s = part.replace(/^\(+/, "").trim();
@@ -102,8 +150,9 @@ function summarizeBashCommand(cmdRaw: string): string {
       s = s.slice(idx + 1).trim();
     }
     if (!s) continue;
-    const token = s.split(/\s+/)[0]?.replace(/^['"]|['"]$/g, "") ?? "";
+    const token = (s.split(/\s+/)[0] ?? "").replace(/^['"]|['"]$/g, "").toLowerCase();
     if (!/^[A-Za-z0-9_./-]+$/.test(token)) continue;
+    if (skipTokens.has(token)) continue;
     if (token === "echo") continue;
     if (token === "cat" && /<<\s*['"]?EOF/i.test(s)) continue;
     if (!commands.includes(token)) commands.push(token);
@@ -424,7 +473,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
 
   const [loading, setLoading] = useState(false);
   const [loadingLabel, setLoadingLabel] = useState("Thinking…");
-  const [cursorBlinkOn, setCursorBlinkOn] = useState(true);
+  const cursorBlinkOn = true;
   const [showPalette, setShowPalette] = useState(false);
   const [paletteIndex, setPaletteIndex] = useState(0);
   const [showModelSelector, setShowModelSelector] = useState(false);
@@ -450,16 +499,6 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       process.stdout.write("\x1b[?1006l\x1b[?1000l");
     };
   }, []);
-
-  useEffect(() => {
-    setCursorBlinkOn(true);
-    if (loading) return;
-    const timer = setInterval(() => {
-      setCursorBlinkOn((prev) => !prev);
-    }, 520);
-    return () => clearInterval(timer);
-  }, [loading, inputValue, inputCursor]);
-
 
   const estimatedTokens = useMemo(() => estimateTokens(messages, undefined), [messages]);
   const contextWindowK = useMemo(() => {
@@ -703,6 +742,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       }
 
       setLoadingLabel("Thinking…");
+      let emptyAssistantRetries = 0;
       for (;;) {
         setLoading(true);
         setLoadingLabel("Thinking…");
@@ -715,6 +755,30 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
           },
         });
         const contentBlocks = response.content ?? [];
+        const hasMeaningfulAssistantOutput = contentBlocks.some(
+          (block) => block.type === "tool_use" || (block.type === "text" && !!block.text?.trim())
+        );
+        if (!hasMeaningfulAssistantOutput) {
+          emptyAssistantRetries += 1;
+          if (emptyAssistantRetries <= MAX_EMPTY_ASSISTANT_RETRIES) {
+            setLoadingLabel(`No output yet, retrying ${emptyAssistantRetries}/${MAX_EMPTY_ASSISTANT_RETRIES}…`);
+            appendLog(
+              colors.muted(
+                `  ${icons.tool} model returned an empty turn, retrying (${emptyAssistantRetries}/${MAX_EMPTY_ASSISTANT_RETRIES})…`
+              )
+            );
+            continue;
+          }
+          appendLog(
+            colors.error(
+              `${icons.error} model returned empty output repeatedly. Stopping this turn; you can submit "continue" to resume.`
+            )
+          );
+          appendLog("");
+          setMessages(state);
+          break;
+        }
+        emptyAssistantRetries = 0;
         const toolResults: Array<{ type: string; tool_use_id: string; content: string }> = [];
         const renderToolOutcome = (
           planned: PlannedToolCall,
