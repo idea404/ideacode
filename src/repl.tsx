@@ -271,6 +271,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
   }, [cwd, onQuit]);
 
   const [loading, setLoading] = useState(false);
+  const [loadingLabel, setLoadingLabel] = useState("Thinking…");
   const [showPalette, setShowPalette] = useState(false);
   const [paletteIndex, setPaletteIndex] = useState(0);
   const [showModelSelector, setShowModelSelector] = useState(false);
@@ -521,6 +522,8 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       const modelContext = modelList.find((m) => m.id === currentModel)?.context_length;
       const maxContextTokens = Math.floor((modelContext ?? CONTEXT_WINDOW_K * 1024) * 0.85);
       const stateBeforeCompress = state;
+      setLoadingLabel("Compressing context…");
+      setLoading(true);
       state = await ensureUnderBudget(apiKey, state, systemPrompt, currentModel, {
         maxTokens: maxContextTokens,
         keepLast: 6,
@@ -530,7 +533,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       }
 
       for (;;) {
-        setLoading(true);
+        setLoadingLabel("Thinking…");
 
         const response = await callApi(apiKey, state, systemPrompt, currentModel);
         const contentBlocks = response.content ?? [];
@@ -1253,7 +1256,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
           <Text color={inkColors.textSecondary}>
             {" "}
             {loading
-              ? `${SPINNER[spinnerTick % SPINNER.length]} Thinking… ${(
+              ? `${SPINNER[spinnerTick % SPINNER.length]} ${loadingLabel} ${(
                   (Date.now() - loadingStartedAtRef.current) /
                   1000
                 ).toFixed(1)}s`
