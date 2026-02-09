@@ -338,7 +338,8 @@ export function toolCallBox(
   toolName: string,
   argPreview: string,
   success = true,
-  extraIndent = 0
+  extraIndent = 0,
+  editDelta?: { added: number; removed: number }
 ): string {
   const indent = TOOL_INDENT + "  ".repeat(Math.max(0, extraIndent));
   const diamondColor = success ? colors.toolSuccess : colors.toolFail;
@@ -346,7 +347,11 @@ export function toolCallBox(
   const argColor = success ? toolSubdued : colors.toolFail;
   const parenColor = colors.mutedDark;
   const name = " " + toolName.trim().toLowerCase();
-  return `${indent}${diamondColor(icons.tool)}${nameColor(name)}${parenColor("(")}${argColor(argPreview)}${parenColor(")")}`;
+  const delta =
+    editDelta != null
+      ? ` ${colors.toolSuccess(`+${editDelta.added}`)} ${colors.toolFail(`-${editDelta.removed}`)}`
+      : "";
+  return `${indent}${diamondColor(icons.tool)}${nameColor(name)}${parenColor("(")}${argColor(argPreview)}${parenColor(")")}${delta}`;
 }
 
 export function toolResultLine(preview: string, success = true): string {

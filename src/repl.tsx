@@ -49,10 +49,7 @@ const MAX_AT_SUGGESTIONS = 12;
 const INITIAL_BANNER_LINES = 12;
 const ENABLE_PARALLEL_TOOL_CALLS = process.env.IDEACODE_PARALLEL_TOOL_CALLS !== "0";
 const PARALLEL_SAFE_TOOLS = new Set(["read", "glob", "grep", "web_fetch", "web_search"]);
-const LOADING_TICK_MS = Math.min(
-  300,
-  Math.max(80, Number.parseInt(process.env.IDEACODE_SPINNER_MS ?? "110", 10) || 110)
-);
+const LOADING_TICK_MS = 90;
 
 const TRUNCATE_NOTE =
   "\n\n(Output truncated to save context. Use read with offset/limit, grep with a specific pattern, or tail with fewer lines to get more.)";
@@ -84,6 +81,51 @@ type PlannedToolCall = {
   toolArgs: Record<string, string | number | boolean | undefined>;
   argPreview: string;
 };
+
+function summarizeBashCommand(cmdRaw: string): string {
+  const fragments = cmdRaw
+    .split(/\n|&&|;/g)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const useful = fragments.filter(
+    (f) =>
+      !/^echo\s+["']?[=\-#]/i.test(f) &&
+      !/^cat\s+<<\s*['"]?EOF/i.test(f) &&
+      f.toUpperCase() !== "EOF"
+  );
+  const source = useful.length > 0 ? useful : fragments;
+  const shown = source.slice(0, 3);
+  const suffix = source.length > 3 ? ` ; … +${source.length - 3}` : "";
+  const joined = shown.join(" ; ") + suffix;
+  return joined.slice(0, 140);
+}
+
+function toolArgPreview(
+  toolName: string,
+  toolArgs: Record<string, string | number | boolean | undefined>
+): string {
+  if (toolName === "bash") {
+    const cmd = String(toolArgs.cmd ?? "").trim();
+    return cmd ? summarizeBashCommand(cmd) : "—";
+  }
+  if ("path" in toolArgs && typeof toolArgs.path === "string") {
+    return toolArgs.path.slice(0, 140) || "—";
+  }
+  const firstVal = Object.values(toolArgs)[0];
+  return String(firstVal ?? "").slice(0, 140) || "—";
+}
+
+function parseEditDelta(result: string): { added: number; removed: number } | undefined {
+  const both = result.match(/ok\s*\(\+(\d+)\s*-(\d+)\)/i);
+  if (both) {
+    return { added: Number.parseInt(both[1] ?? "0", 10), removed: Number.parseInt(both[2] ?? "0", 10) };
+  }
+  const addOnly = result.match(/ok\s*\(\+(\d+)\)/i);
+  if (addOnly) {
+    return { added: Number.parseInt(addOnly[1] ?? "0", 10), removed: 0 };
+  }
+  return undefined;
+}
 
 function parseAtSegments(value: string): InputSegment[] {
   const segments: InputSegment[] = [];
@@ -140,11 +182,22 @@ function replayMessagesToLogLines(
             const block = toolUses.find((b) => b.id === tr.tool_use_id);
             if (block?.name) {
               const name = block.name.trim().toLowerCase();
-              const firstVal = block.input && typeof block.input === "object" ? Object.values(block.input)[0] : undefined;
-              const argPreview = String(firstVal ?? "").slice(0, 50) || "—";
+              const args =
+                block.input && typeof block.input === "object"
+                  ? (block.input as Record<string, string | number | boolean | undefined>)
+                  : {};
+              const argPreview = toolArgPreview(name, args).slice(0, 60);
               const content = tr.content ?? "";
               const ok = !content.startsWith("error:");
-              lines.push(toolCallBox(name, argPreview, ok));
+              lines.push(
+                toolCallBox(
+                  name,
+                  argPreview,
+                  ok,
+                  0,
+                  name === "edit" || name === "write" ? parseEditDelta(content) : undefined
+                )
+              );
               const tokens = estimateTokensForString(content);
               lines.push(toolResultTokenLine(tokens, ok));
             }
@@ -187,6 +240,50 @@ function useTerminalSize(): { rows: number; columns: number } {
   }, [stdout]);
   return size;
 }
+
+function shimmerLabel(label: string, frame: number): string {
+  if (!label) return "";
+  const width = Math.max(4, Math.min(10, Math.floor(label.length / 3)));
+  const travel = Math.max(1, label.length - width);
+  const period = travel * 2;
+  const phase = frame % period;
+  const head = phase <= travel ? phase : period - phase;
+  let out = "";
+  for (let i = 0; i < label.length; i++) {
+    const inWindow = i >= head && i < head + width;
+    out += inWindow ? colors.gray(label[i] ?? "") : colors.mutedDark(label[i] ?? "");
+  }
+  return out;
+}
+
+const LoadingStatus = React.memo(function LoadingStatus({
+  active,
+  label,
+}: {
+  active: boolean;
+  label: string;
+}) {
+  const [frame, setFrame] = useState(0);
+  const [startedAt, setStartedAt] = useState(0);
+
+  useEffect(() => {
+    if (!active) return;
+    setStartedAt(Date.now());
+    setFrame(0);
+    const t = setInterval(() => setFrame((n) => n + 1), LOADING_TICK_MS);
+    return () => clearInterval(t);
+  }, [active, label]);
+
+  if (!active) return <Text color={inkColors.textSecondary}>{"\u00A0"}</Text>;
+
+  const elapsedSec = Math.max(0, (Date.now() - startedAt) / 1000);
+  return (
+    <Text color={inkColors.textSecondary}>
+      {" "}
+      {shimmerLabel(label, frame)} {colors.gray(`${elapsedSec.toFixed(1)}s`)}
+    </Text>
+  );
+});
 
 export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
   const { rows: termRows, columns: termColumns } = useTerminalSize();
@@ -297,9 +394,6 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
     };
   }, []);
 
-  const [spinnerTick, setSpinnerTick] = useState(0);
-  const loadingStartedAtRef = useRef<number>(0);
-  const SPINNER = ["●○○", "○●○", "○○●", "○●○"];
 
   const estimatedTokens = useMemo(() => estimateTokens(messages, undefined), [messages]);
   const contextWindowK = useMemo(() => {
@@ -337,14 +431,6 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
     if (showModelSelector && filteredModelList.length > 0)
       setModelIndex((i) => Math.min(i, filteredModelList.length - 1));
   }, [showModelSelector, filteredModelList.length]);
-
-  useEffect(() => {
-    if (!loading) return;
-    loadingStartedAtRef.current = Date.now();
-    setSpinnerTick(0);
-    const t = setInterval(() => setSpinnerTick((n) => n + 1), LOADING_TICK_MS);
-    return () => clearInterval(t);
-  }, [loading]);
 
   const showSlashSuggestions = inputValue.startsWith("/");
   const filteredSlashCommands = useMemo(() => {
@@ -517,7 +603,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       appendLog("");
 
       let state: Array<{ role: string; content: unknown }> = [...messages, { role: "user", content: userInput }];
-      const systemPrompt = `Concise coding assistant. cwd: ${cwd}. PRIORITIZE grep to locate; then read with offset and limit to fetch only relevant sections. Do not read whole files unless the user explicitly asks. Use focused greps (specific patterns, narrow paths) and read in chunks when files are large; avoid one huge grep or read that floods context. When exploring a dependency, set path to that package (e.g. node_modules/<pkg>) and list/read only what you need. Prefer grep or keyword search for the most recent or specific occurrence; avoid tail/read of thousands of lines. If a tool result says it was truncated, call the tool again with offset, limit, or a narrower pattern to get what you need. Use as many parallel read/search/web tool calls as needed in one turn when they are independent (often more than 3 is appropriate for broad research), but keep each call high-signal, non-redundant, and minimal in output size.`;
+      const systemPrompt = `Concise coding assistant. cwd: ${cwd}. PRIORITIZE grep to locate; then read with offset and limit to fetch only relevant sections. Do not read whole files unless the user explicitly asks. Use focused greps (specific patterns, narrow paths) and read in chunks when files are large; avoid one huge grep or read that floods context. When exploring a dependency, set path to that package (e.g. node_modules/<pkg>) and list/read only what you need. Prefer grep or keyword search for the most recent or specific occurrence; avoid tail/read of thousands of lines. If a tool result says it was truncated, call the tool again with offset, limit, or a narrower pattern to get what you need. Use as many parallel read/search/web tool calls as needed in one turn when they are independent (often more than 3 is appropriate for broad research), but keep each call high-signal, non-redundant, and minimal in output size. For bash tool calls, avoid decorative echo headers; run direct commands and keep commands concise.`;
 
       const modelContext = modelList.find((m) => m.id === currentModel)?.context_length;
       const maxContextTokens = Math.floor((modelContext ?? CONTEXT_WINDOW_K * 1024) * 0.85);
@@ -544,7 +630,15 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
           extraIndent = 0
         ): void => {
           const ok = !result.startsWith("error:");
-          appendLog(toolCallBox(planned.toolName, planned.argPreview, ok, extraIndent));
+          appendLog(
+            toolCallBox(
+              planned.toolName,
+              planned.argPreview,
+              ok,
+              extraIndent,
+              planned.toolName === "edit" || planned.toolName === "write" ? parseEditDelta(result) : undefined
+            )
+          );
           const contentForApi = truncateToolResult(result);
           const tokens = estimateTokensForString(contentForApi);
           appendLog(toolResultTokenLine(tokens, ok, extraIndent));
@@ -588,12 +682,11 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
 
           const toolName = block.name.trim().toLowerCase();
           const toolArgs = block.input as Record<string, string | number | boolean | undefined>;
-          const firstVal = Object.values(toolArgs)[0];
           const planned: PlannedToolCall = {
             block,
             toolName,
             toolArgs,
-            argPreview: String(firstVal ?? "").slice(0, 100) || "—",
+            argPreview: toolArgPreview(toolName, toolArgs),
           };
 
           if (ENABLE_PARALLEL_TOOL_CALLS && PARALLEL_SAFE_TOOLS.has(toolName)) {
@@ -1253,15 +1346,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
           ))}
         </Box>
         <Box flexDirection="row" marginTop={1} marginBottom={0}>
-          <Text color={inkColors.textSecondary}>
-            {" "}
-            {loading
-              ? `${SPINNER[spinnerTick % SPINNER.length]} ${loadingLabel} ${(
-                  (Date.now() - loadingStartedAtRef.current) /
-                  1000
-                ).toFixed(1)}s`
-              : "\u00A0"}
-          </Text>
+          <LoadingStatus active={loading} label={loadingLabel} />
         </Box>
       </Box>
       <Box flexDirection="column" flexShrink={0} height={footerLines}>

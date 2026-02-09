@@ -24,8 +24,10 @@ export function readFile(args: ToolArgs): string {
 }
 
 export function writeFile(args: ToolArgs): string {
-  fs.writeFileSync(args.path as string, args.content as string, "utf-8");
-  return "ok";
+  const content = args.content as string;
+  fs.writeFileSync(args.path as string, content, "utf-8");
+  const added = content === "" ? 0 : content.split("\n").length;
+  return `ok (+${added})`;
 }
 
 export function editFile(args: ToolArgs): string {
@@ -44,5 +46,9 @@ export function editFile(args: ToolArgs): string {
   }
   const replacement = args.all ? text.split(oldStr).join(newStr) : text.replace(oldStr, newStr);
   fs.writeFileSync(args.path as string, replacement, "utf-8");
-  return "ok";
+  const oldLines = oldStr === "" ? 0 : oldStr.split("\n").length;
+  const newLines = newStr === "" ? 0 : newStr.split("\n").length;
+  const removed = oldLines * count;
+  const added = newLines * count;
+  return `ok (+${added} -${removed})`;
 }
