@@ -234,7 +234,7 @@ function replayMessagesToLogLines(
 type ReplProps = {
   apiKey: string;
   cwd: string;
-  onQuit: () => void;
+  onQuit: (transcriptLines: string[]) => void;
 };
 
 function useTerminalSize(): { rows: number; columns: number } {
@@ -354,6 +354,10 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
     }
     return banner;
   });
+  const logLinesRef = useRef(logLines);
+  useEffect(() => {
+    logLinesRef.current = logLines;
+  }, [logLines]);
   const [inputValue, setInputValue] = useState("");
   const [currentModel, setCurrentModel] = useState(getModel);
   const [messages, setMessages] = useState<Array<{ role: string; content: unknown }>>(() =>
@@ -409,17 +413,18 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       if (process.stdout.isTTY) {
         writeSync(
           process.stdout.fd,
-          "\x1b[?1049l\x1b[?1047l\x1b[?47l\x1b[?2004l\x1b[?1004l\x1b[?1007l\x1b[?1015l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[0m"
+          "\x1b[?2004l\x1b[?1004l\x1b[?1007l\x1b[?1015l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[0m"
         );
       }
     } catch {
       // Ignore restore failures during teardown.
     }
-    onQuit();
+    onQuit(logLinesRef.current);
   }, [cwd, onQuit]);
 
   const [loading, setLoading] = useState(false);
   const [loadingLabel, setLoadingLabel] = useState("Thinking…");
+  const [cursorBlinkOn, setCursorBlinkOn] = useState(true);
   const [showPalette, setShowPalette] = useState(false);
   const [paletteIndex, setPaletteIndex] = useState(0);
   const [showModelSelector, setShowModelSelector] = useState(false);
@@ -445,6 +450,15 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       process.stdout.write("\x1b[?1006l\x1b[?1000l");
     };
   }, []);
+
+  useEffect(() => {
+    setCursorBlinkOn(true);
+    if (loading) return;
+    const timer = setInterval(() => {
+      setCursorBlinkOn((prev) => !prev);
+    }, 520);
+    return () => clearInterval(timer);
+  }, [loading, inputValue, inputCursor]);
 
 
   const estimatedTokens = useMemo(() => estimateTokens(messages, undefined), [messages]);
@@ -1471,7 +1485,11 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         {inputValue.length === 0 ? (
           <Box flexDirection="row">
             <Text color={inkColors.primary}>{icons.prompt} </Text>
-            <Text inverse color={inkColors.primary}> </Text>
+            {cursorBlinkOn ? (
+              <Text inverse color={inkColors.primary}> </Text>
+            ) : (
+              <Text color={inkColors.primary}> </Text>
+            )}
             <Text color={inkColors.textSecondary}>Message or / for commands, @ for files, ! for shell, ? for help...</Text>
           </Box>
         ) : (
@@ -1509,11 +1527,17 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
 
                       const rowNodes: React.ReactNode[] = [];
                       if (lineText === "" && v === 0 && cursorOnThisLine) {
-                        rowNodes.push(
-                          <Text key="cursor-empty" inverse color={inkColors.primary}>
-                            {"\u00A0"}
-                          </Text>
-                        );
+                        rowNodes.push(cursorBlinkOn
+                          ? (
+                            <Text key="cursor-empty-on" inverse color={inkColors.primary}>
+                              {"\u00A0"}
+                            </Text>
+                          )
+                          : (
+                            <Text key="cursor-empty-off" color={inkColors.primary}>
+                              {"\u00A0"}
+                            </Text>
+                          ));
                       } else if (cursorPosInVisual >= 0) {
                         const before = visualChunk.slice(0, cursorPosInVisual);
                         const curChar =
@@ -1525,11 +1549,15 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
                             ? visualChunk.slice(cursorPosInVisual + 1)
                             : "";
                         rowNodes.push(<Text key="plain-before">{before}</Text>);
-                        rowNodes.push(
-                          <Text key="plain-caret" inverse color={inkColors.primary}>
-                            {curChar}
-                          </Text>
-                        );
+                        rowNodes.push(cursorBlinkOn
+                          ? (
+                            <Text key="plain-caret-on" inverse color={inkColors.primary}>
+                              {curChar}
+                            </Text>
+                          )
+                          : (
+                            <Text key="plain-caret-off">{curChar}</Text>
+                          ));
                         rowNodes.push(<Text key="plain-after">{after}</Text>);
                       } else {
                         rowNodes.push(<Text key="plain">{visualChunk}</Text>);
@@ -1627,11 +1655,17 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
                         : -1;
                     const lineNodes: React.ReactNode[] = [];
                     if (lineText === "" && v === 0 && cursorOnThisLine) {
-                      lineNodes.push(
-                        <Text key="cursor" inverse color={inkColors.primary}>
-                          {"\u00A0"}
-                        </Text>
-                      );
+                      lineNodes.push(cursorBlinkOn
+                        ? (
+                          <Text key="cursor-on" inverse color={inkColors.primary}>
+                            {"\u00A0"}
+                          </Text>
+                        )
+                        : (
+                          <Text key="cursor-off" color={inkColors.primary}>
+                            {"\u00A0"}
+                          </Text>
+                        ));
                     } else {
                       let cursorRendered = false;
                       segmentsWithStyle.forEach((seg, segIdx) => {
@@ -1650,16 +1684,24 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
                             const after = text.slice(segRel + 1);
                             const usePath = "color" in seg.style && !!seg.style.color;
                             lineNodes.push(<Text key={`${segIdx}-a`} {...seg.style}>{before}</Text>);
-                            lineNodes.push(
-                              <Text
-                                key={`${segIdx}-b`}
-                                inverse
-                                color={usePath ? inkColors.path : inkColors.primary}
-                                bold={"bold" in seg.style && !!seg.style.bold}
-                              >
-                                {curChar}
-                              </Text>
-                            );
+                            if (cursorBlinkOn) {
+                              lineNodes.push(
+                                <Text
+                                  key={`${segIdx}-b-on`}
+                                  inverse
+                                  color={usePath ? inkColors.path : inkColors.primary}
+                                  bold={"bold" in seg.style && !!seg.style.bold}
+                                >
+                                  {curChar}
+                                </Text>
+                              );
+                            } else {
+                              lineNodes.push(
+                                <Text key={`${segIdx}-b-off`} {...seg.style}>
+                                  {curChar}
+                                </Text>
+                              );
+                            }
                             lineNodes.push(<Text key={`${segIdx}-c`} {...seg.style}>{after}</Text>);
                             cursorRendered = true;
                           } else {
@@ -1670,11 +1712,17 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
                         }
                       });
                       if (cursorPosInVisual >= 0 && !cursorRendered) {
-                        lineNodes.push(
-                          <Text key="cursor-end" inverse color={inkColors.primary}>
-                            {"\u00A0"}
-                          </Text>
-                        );
+                        lineNodes.push(cursorBlinkOn
+                          ? (
+                            <Text key="cursor-end-on" inverse color={inkColors.primary}>
+                              {"\u00A0"}
+                            </Text>
+                          )
+                          : (
+                            <Text key="cursor-end-off" color={inkColors.primary}>
+                              {"\u00A0"}
+                            </Text>
+                          ));
                       }
                     }
                     const isFirstRow = lineIdx === 0 && v === 0;
