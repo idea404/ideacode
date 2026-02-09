@@ -60,6 +60,7 @@ const PARALLEL_SAFE_TOOLS = new Set([
 ]);
 const LOADING_TICK_MS = 80;
 const MAX_EMPTY_ASSISTANT_RETRIES = 3;
+const TYPING_LAYOUT_FREEZE_MS = 180;
 
 const TRUNCATE_NOTE =
   "\n\n(Output truncated to save context. Use read with offset/limit, grep with a specific pattern, or tail with fewer lines to get more.)";
@@ -458,12 +459,16 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
   const [showHelpModal, setShowHelpModal] = useState(false);
   const [slashSuggestionIndex, setSlashSuggestionIndex] = useState(0);
   const [inputCursor, setInputCursor] = useState(0);
+  const [isInputLayoutFrozen, setIsInputLayoutFrozen] = useState(false);
+  const [frozenFooterLines, setFrozenFooterLines] = useState(2);
   const skipNextSubmitRef = useRef(false);
   const queuedMessageRef = useRef<string | null>(null);
   const lastUserMessageRef = useRef<string>("");
   const [logScrollOffset, setLogScrollOffset] = useState(0);
   const scrollBoundsRef = useRef({ maxLogScrollOffset: 0, logViewportHeight: 1 });
   const prevEscRef = useRef(false);
+  const inputChangeMountedRef = useRef(false);
+  const typingFreezeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     // Enable SGR mouse + basic tracking so trackpad wheel scrolling works.
@@ -562,6 +567,30 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
   useEffect(() => {
     setInputCursor((c) => Math.min(c, Math.max(0, inputValue.length)));
   }, [inputValue.length]);
+
+  useEffect(() => {
+    if (!inputChangeMountedRef.current) {
+      inputChangeMountedRef.current = true;
+      return;
+    }
+    setIsInputLayoutFrozen(true);
+    if (typingFreezeTimerRef.current) {
+      clearTimeout(typingFreezeTimerRef.current);
+    }
+    typingFreezeTimerRef.current = setTimeout(() => {
+      setIsInputLayoutFrozen(false);
+      typingFreezeTimerRef.current = null;
+    }, TYPING_LAYOUT_FREEZE_MS);
+  }, [inputValue, inputCursor]);
+
+  useEffect(() => {
+    return () => {
+      if (typingFreezeTimerRef.current) {
+        clearTimeout(typingFreezeTimerRef.current);
+        typingFreezeTimerRef.current = null;
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (apiKey) fetchModels(apiKey).then(setModelList);
@@ -1518,7 +1547,13 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
     );
   }
 
-  const footerLines = suggestionBoxLines + 1 + stableInputLineCount;
+  const calculatedFooterLines = suggestionBoxLines + 1 + stableInputLineCount;
+  useEffect(() => {
+    if (!isInputLayoutFrozen) {
+      setFrozenFooterLines(calculatedFooterLines);
+    }
+  }, [isInputLayoutFrozen, calculatedFooterLines]);
+  const footerLines = isInputLayoutFrozen ? frozenFooterLines : calculatedFooterLines;
   loadingFooterLinesRef.current = footerLines;
   return (
     <Box flexDirection="column" height={termRows} overflow="hidden">
