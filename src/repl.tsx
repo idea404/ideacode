@@ -5,6 +5,7 @@ import React, { useState, useCallback, useRef, useMemo, useEffect } from "react"
 import { Box, Text, useInput, useStdout } from "ink";
 import { globSync } from "glob";
 import * as path from "node:path";
+import { writeSync } from "node:fs";
 import gradient from "gradient-string";
 
 // Custom matcha-themed gradient: matcha green → dark sepia
@@ -49,7 +50,7 @@ const MAX_AT_SUGGESTIONS = 12;
 const INITIAL_BANNER_LINES = 12;
 const ENABLE_PARALLEL_TOOL_CALLS = process.env.IDEACODE_PARALLEL_TOOL_CALLS !== "0";
 const PARALLEL_SAFE_TOOLS = new Set(["read", "glob", "grep", "web_fetch", "web_search"]);
-const LOADING_TICK_MS = 90;
+const LOADING_TICK_MS = 80;
 
 const TRUNCATE_NOTE =
   "\n\n(Output truncated to save context. Use read with offset/limit, grep with a specific pattern, or tail with fewer lines to get more.)";
@@ -83,21 +84,34 @@ type PlannedToolCall = {
 };
 
 function summarizeBashCommand(cmdRaw: string): string {
-  const fragments = cmdRaw
-    .split(/\n|&&|;/g)
+  const parts = cmdRaw
+    .split(/\n|&&|;|\|/g)
     .map((s) => s.trim())
     .filter(Boolean);
-  const useful = fragments.filter(
-    (f) =>
-      !/^echo\s+["']?[=\-#]/i.test(f) &&
-      !/^cat\s+<<\s*['"]?EOF/i.test(f) &&
-      f.toUpperCase() !== "EOF"
-  );
-  const source = useful.length > 0 ? useful : fragments;
-  const shown = source.slice(0, 3);
-  const suffix = source.length > 3 ? ` ; … +${source.length - 3}` : "";
-  const joined = shown.join(" ; ") + suffix;
-  return joined.slice(0, 140);
+  const commands: string[] = [];
+  for (const part of parts) {
+    let s = part.replace(/^\(+/, "").trim();
+    if (!s || s.toUpperCase() === "EOF") continue;
+    // Strip simple environment assignments at the front: FOO=bar CMD
+    while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(s)) {
+      const idx = s.indexOf(" ");
+      if (idx === -1) {
+        s = "";
+        break;
+      }
+      s = s.slice(idx + 1).trim();
+    }
+    if (!s) continue;
+    const token = s.split(/\s+/)[0]?.replace(/^['"]|['"]$/g, "") ?? "";
+    if (!/^[A-Za-z0-9_./-]+$/.test(token)) continue;
+    if (token === "echo") continue;
+    if (token === "cat" && /<<\s*['"]?EOF/i.test(s)) continue;
+    if (!commands.includes(token)) commands.push(token);
+  }
+  if (commands.length === 0) return "bash";
+  const shown = commands.slice(0, 5);
+  const suffix = commands.length > 5 ? `, +${commands.length - 5}` : "";
+  return (shown.join(", ") + suffix).slice(0, 140);
 }
 
 function toolArgPreview(
@@ -241,19 +255,32 @@ function useTerminalSize(): { rows: number; columns: number } {
   return size;
 }
 
-function shimmerLabel(label: string, frame: number): string {
-  if (!label) return "";
-  const width = Math.max(4, Math.min(10, Math.floor(label.length / 3)));
-  const travel = Math.max(1, label.length - width);
-  const period = travel * 2;
-  const phase = frame % period;
-  const head = phase <= travel ? phase : period - phase;
-  let out = "";
-  for (let i = 0; i < label.length; i++) {
-    const inWindow = i >= head && i < head + width;
-    out += inWindow ? colors.gray(label[i] ?? "") : colors.mutedDark(label[i] ?? "");
-  }
-  return out;
+const LogViewport = React.memo(function LogViewport({
+  lines,
+  startIndex,
+  height,
+}: {
+  lines: string[];
+  startIndex: number;
+  height: number;
+}) {
+  return (
+    <Box flexDirection="column" height={height} overflow="hidden">
+      {lines.map((line, i) => (
+        <Text key={startIndex + i}>{line === "" ? "\u00A0" : line}</Text>
+      ))}
+    </Box>
+  );
+});
+
+function orbitDots(frame: number): string {
+  const phase = frame % 6;
+  const activeIndex = phase <= 3 ? phase : 6 - phase;
+  const slots = ["·", "·", "·", "·"];
+  slots[activeIndex] = "●";
+  return slots
+    .map((ch, i) => (i === activeIndex ? colors.gray(ch) : colors.mutedDark(ch)))
+    .join("");
 }
 
 const LoadingStatus = React.memo(function LoadingStatus({
@@ -264,23 +291,33 @@ const LoadingStatus = React.memo(function LoadingStatus({
   label: string;
 }) {
   const [frame, setFrame] = useState(0);
-  const [startedAt, setStartedAt] = useState(0);
+  const startedAtRef = useRef<number | null>(null);
 
   useEffect(() => {
-    if (!active) return;
-    setStartedAt(Date.now());
-    setFrame(0);
-    const t = setInterval(() => setFrame((n) => n + 1), LOADING_TICK_MS);
-    return () => clearInterval(t);
-  }, [active, label]);
+    if (!active) {
+      startedAtRef.current = null;
+      return;
+    }
+    if (startedAtRef.current == null) {
+      startedAtRef.current = Date.now();
+      setFrame(0);
+    }
+    const anim = setInterval(() => setFrame((n) => n + 1), LOADING_TICK_MS);
+    return () => {
+      clearInterval(anim);
+    };
+  }, [active]);
 
   if (!active) return <Text color={inkColors.textSecondary}>{"\u00A0"}</Text>;
+  const startedAt = startedAtRef.current ?? Date.now();
+  const elapsedSeconds = Math.max(0, (Date.now() - startedAt) / 1000);
+  const elapsedText =
+    elapsedSeconds < 10 ? `${elapsedSeconds.toFixed(1)}s` : `${Math.floor(elapsedSeconds)}s`;
 
-  const elapsedSec = Math.max(0, (Date.now() - startedAt) / 1000);
   return (
     <Text color={inkColors.textSecondary}>
       {" "}
-      {shimmerLabel(label, frame)} {colors.gray(`${elapsedSec.toFixed(1)}s`)}
+      {orbitDots(frame)} {colors.gray(label)} {colors.gray(elapsedText)}
     </Text>
   );
 });
@@ -364,6 +401,20 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
   const handleQuit = useCallback(() => {
     if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
     saveConversation(cwd, messagesRef.current);
+    // Best-effort terminal mode reset in case process exits before React cleanup runs.
+    try {
+      if (process.stdin.isTTY && typeof process.stdin.setRawMode === "function") {
+        process.stdin.setRawMode(false);
+      }
+      if (process.stdout.isTTY) {
+        writeSync(
+          process.stdout.fd,
+          "\x1b[?1049l\x1b[?1047l\x1b[?47l\x1b[?2004l\x1b[?1004l\x1b[?1007l\x1b[?1015l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[0m"
+        );
+      }
+    } catch {
+      // Ignore restore failures during teardown.
+    }
     onQuit();
   }, [cwd, onQuit]);
 
@@ -388,6 +439,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
   const prevEscRef = useRef(false);
 
   useEffect(() => {
+    // Enable SGR mouse + basic tracking so trackpad wheel scrolling works.
     process.stdout.write("\x1b[?1006h\x1b[?1000h");
     return () => {
       process.stdout.write("\x1b[?1006l\x1b[?1000l");
@@ -411,6 +463,24 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         (m.name ?? "").toLowerCase().includes(q)
     );
   }, [modelList, modelSearchFilter]);
+
+  const wrapWidth = Math.max(10, termColumns - PROMPT_INDENT_LEN - 2);
+  const inputLineCount = useMemo(() => {
+    const lines = inputValue.split("\n");
+    return lines.reduce(
+      (sum, line) => sum + Math.max(1, Math.ceil(line.length / wrapWidth)),
+      0
+    );
+  }, [inputValue, wrapWidth]);
+  const [stableInputLineCount, setStableInputLineCount] = useState(inputLineCount);
+  useEffect(() => {
+    if (inputLineCount <= 1) {
+      setStableInputLineCount(1);
+      return;
+    }
+    const t = setTimeout(() => setStableInputLineCount(inputLineCount), 90);
+    return () => clearTimeout(t);
+  }, [inputLineCount]);
 
   useEffect(() => {
     setInputCursor((c) => Math.min(c, Math.max(0, inputValue.length)));
@@ -612,16 +682,24 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       setLoading(true);
       state = await ensureUnderBudget(apiKey, state, systemPrompt, currentModel, {
         maxTokens: maxContextTokens,
-        keepLast: 6,
+        keepLast: 8,
       });
       if (state.length < stateBeforeCompress.length) {
         appendLog(colors.muted("  (context compressed to stay under limit)\n"));
       }
 
+      setLoadingLabel("Thinking…");
       for (;;) {
+        setLoading(true);
         setLoadingLabel("Thinking…");
 
-        const response = await callApi(apiKey, state, systemPrompt, currentModel);
+        const response = await callApi(apiKey, state, systemPrompt, currentModel, {
+          onRetry: ({ attempt, maxAttempts, waitMs, status }) => {
+            setLoadingLabel(
+              `Rate limited (${status}), retry ${attempt}/${maxAttempts} in ${(waitMs / 1000).toFixed(1)}s…`
+            );
+          },
+        });
         const contentBlocks = response.content ?? [];
         const toolResults: Array<{ type: string; tool_use_id: string; content: string }> = [];
         const renderToolOutcome = (
@@ -649,6 +727,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
 
         const runParallelBatch = async (batch: PlannedToolCall[]): Promise<void> => {
           if (batch.length === 0) return;
+          setLoadingLabel(`Running ${batch.length} tools in parallel…`);
           const started = Date.now();
           const groupedTools = Array.from(
             batch.reduce((acc, planned) => {
@@ -696,12 +775,11 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
 
           await runParallelBatch(parallelBatch);
           parallelBatch = [];
+          setLoadingLabel(`Running ${planned.toolName}…`);
           const result = await runTool(planned.toolName, planned.toolArgs);
           renderToolOutcome(planned, result);
         }
         await runParallelBatch(parallelBatch);
-
-        setLoading(false);
 
         state = [...state, { role: "assistant", content: contentBlocks }];
         if (toolResults.length === 0) {
@@ -711,6 +789,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         state = [...state, { role: "user", content: toolResults }];
         setMessages(state);
       }
+      setLoading(false);
 
       return true;
     },
@@ -1157,16 +1236,8 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
     ? 4 + Math.max(1, filteredFilePaths.length)
     : 0;
   const suggestionBoxLines = slashSuggestionBoxLines || atSuggestionBoxLines;
-  const wrapWidth = Math.max(10, termColumns - PROMPT_INDENT_LEN - 2);
-  const inputLineCount = (() => {
-    const lines = inputValue.split("\n");
-    return lines.reduce(
-      (sum, line) => sum + Math.max(1, Math.ceil(line.length / wrapWidth)),
-      0
-    );
-  })();
   // Keep a fixed loading row reserved to avoid viewport jumps/flicker when loading starts/stops.
-  const reservedLines = 1 + inputLineCount + 2;
+  const reservedLines = 1 + stableInputLineCount + 2;
   const logViewportHeight = Math.max(1, termRows - reservedLines - suggestionBoxLines);
   const effectiveLogLines = logLines;
   const maxLogScrollOffset = Math.max(0, effectiveLogLines.length - logViewportHeight);
@@ -1179,7 +1250,11 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
     logStartIndex = 0;
   }
   const sliceEnd = logStartIndex + logViewportHeight;
-  const visibleLogLines = effectiveLogLines.slice(logStartIndex, sliceEnd);
+  const visibleLogLines = useMemo(
+    () => effectiveLogLines.slice(logStartIndex, sliceEnd),
+    [effectiveLogLines, logStartIndex, sliceEnd]
+  );
+  const useSimpleInputRenderer = inputLineCount > 1;
 
   if (showHelpModal) {
     const helpModalWidth = Math.min(88, Math.max(80, termColumns - 4));
@@ -1334,17 +1409,11 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
     );
   }
 
-  const footerLines = suggestionBoxLines + 1 + inputLineCount;
+  const footerLines = suggestionBoxLines + 1 + stableInputLineCount;
   return (
     <Box flexDirection="column" height={termRows} overflow="hidden">
       <Box flexDirection="column" flexGrow={1} minHeight={0} overflow="hidden">
-        <Box flexDirection="column" height={logViewportHeight} overflow="hidden">
-          {visibleLogLines.map((line, i) => (
-            <Text key={effectiveLogLines.length - visibleLogLines.length + i}>
-              {line === "" ? "\u00A0" : line}
-            </Text>
-          ))}
-        </Box>
+        <LogViewport lines={visibleLogLines} startIndex={logStartIndex} height={logViewportHeight} />
         <Box flexDirection="row" marginTop={1} marginBottom={0}>
           <LoadingStatus active={loading} label={loadingLabel} />
         </Box>
@@ -1417,6 +1486,72 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
                   const cursorOffsetInLine = cursorOnThisLine ? inputCursor - lineStart : -1;
                   const currentLineStart = lineStart;
                   lineStart = lineEnd + 1;
+                  if (useSimpleInputRenderer) {
+                    const visualLines = wrapLine(lineText, wrapWidth);
+                    return visualLines.map((visualChunk, v) => {
+                      const visualStart = v * wrapWidth;
+                      const visualEnd = Math.min((v + 1) * wrapWidth, lineText.length);
+                      const isLastVisualOfThisLine = v === visualLines.length - 1;
+                      const cursorAtEndOfVisual =
+                        isLastVisualOfThisLine && cursorOffsetInLine === visualEnd;
+                      const cursorPosInVisual =
+                        cursorOnThisLine &&
+                        cursorOffsetInLine >= visualStart &&
+                        (cursorOffsetInLine < visualEnd || cursorAtEndOfVisual)
+                          ? cursorOffsetInLine < visualEnd
+                            ? cursorOffsetInLine - visualStart
+                            : visualEnd - visualStart
+                          : -1;
+
+                      const isFirstRow = lineIdx === 0 && v === 0;
+                      const isLastLogicalLine = lineIdx === lines.length - 1;
+                      const isLastVisualOfLine = v === visualLines.length - 1;
+
+                      const rowNodes: React.ReactNode[] = [];
+                      if (lineText === "" && v === 0 && cursorOnThisLine) {
+                        rowNodes.push(
+                          <Text key="cursor-empty" inverse color={inkColors.primary}>
+                            {"\u00A0"}
+                          </Text>
+                        );
+                      } else if (cursorPosInVisual >= 0) {
+                        const before = visualChunk.slice(0, cursorPosInVisual);
+                        const curChar =
+                          cursorPosInVisual < visualChunk.length
+                            ? visualChunk[cursorPosInVisual]
+                            : "\u00A0";
+                        const after =
+                          cursorPosInVisual < visualChunk.length
+                            ? visualChunk.slice(cursorPosInVisual + 1)
+                            : "";
+                        rowNodes.push(<Text key="plain-before">{before}</Text>);
+                        rowNodes.push(
+                          <Text key="plain-caret" inverse color={inkColors.primary}>
+                            {curChar}
+                          </Text>
+                        );
+                        rowNodes.push(<Text key="plain-after">{after}</Text>);
+                      } else {
+                        rowNodes.push(<Text key="plain">{visualChunk}</Text>);
+                      }
+
+                      return (
+                        <Box key={`simple-${lineIdx}-${v}`} flexDirection="row">
+                          {isFirstRow ? (
+                            <Text color={inkColors.primary}>{icons.prompt} </Text>
+                          ) : (
+                            <Text>{" ".repeat(PROMPT_INDENT_LEN)}</Text>
+                          )}
+                          {rowNodes}
+                          {isLastLogicalLine && isLastVisualOfLine && inputValue.startsWith("!") && (
+                            <Text color={inkColors.textDisabled}>
+                              {"  — "}type a shell command to run
+                            </Text>
+                          )}
+                        </Box>
+                      );
+                    });
+                  }
                   const segments = parseAtSegments(lineText);
                   let runIdx = 0;
                   const segmentsWithStyle: Array<{

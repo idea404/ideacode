@@ -29,18 +29,35 @@ export async function fetchModels(apiKey: string): Promise<OpenRouterModel[]> {
   return json.data ?? [];
 }
 
-const MAX_RETRIES = 3;
-const INITIAL_BACKOFF_MS = 1000;
+const MAX_RETRIES = 8;
+const INITIAL_BACKOFF_MS = 1200;
+const MAX_BACKOFF_MS = 30_000;
+const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function computeRetryDelayMs(attempt: number, retryAfterHeader: string | null): number {
+  if (retryAfterHeader) {
+    const retrySeconds = Number.parseFloat(retryAfterHeader);
+    if (Number.isFinite(retrySeconds) && retrySeconds > 0) {
+      return Math.max(1000, Math.min(MAX_BACKOFF_MS, Math.round(retrySeconds * 1000)));
+    }
+  }
+  const base = Math.min(MAX_BACKOFF_MS, INITIAL_BACKOFF_MS * Math.pow(2, attempt));
+  const jitter = 0.75 + Math.random() * 0.5; // 0.75x .. 1.25x
+  return Math.max(1000, Math.round(base * jitter));
 }
 
 export async function callApi(
   apiKey: string,
   messages: Array<{ role: string; content: unknown }>,
   systemPrompt: string,
-  model: string
+  model: string,
+  callbacks?: {
+    onRetry?: (info: { attempt: number; maxAttempts: number; waitMs: number; status: number }) => void;
+  }
 ): Promise<{ content?: ContentBlock[] }> {
   const body = {
     model,
@@ -62,11 +79,15 @@ export async function callApi(
     if (res.ok) return res.json();
     const text = await res.text();
     lastError = new Error(`API ${res.status}: ${text}`);
-    if ((res.status === 429 || res.status === 503) && attempt < MAX_RETRIES) {
+    if (RETRYABLE_STATUS.has(res.status) && attempt < MAX_RETRIES) {
       const retryAfter = res.headers.get("retry-after");
-      const waitMs = retryAfter
-        ? Math.max(1000, parseInt(retryAfter, 10) * 1000)
-        : INITIAL_BACKOFF_MS * Math.pow(2, attempt);
+      const waitMs = computeRetryDelayMs(attempt, retryAfter);
+      callbacks?.onRetry?.({
+        attempt: attempt + 1,
+        maxAttempts: MAX_RETRIES + 1,
+        waitMs,
+        status: res.status,
+      });
       await sleep(waitMs);
       continue;
     }
@@ -219,7 +240,7 @@ export async function callApiStream(
 }
 
 const SUMMARIZE_SYSTEM =
-  "You are a summarizer. Summarize the following conversation between user and assistant, including any tool use and results. Preserve the user's goal, key decisions, and important facts. Output only the summary, no preamble.";
+  "You are a summarizer. Compress the conversation while preserving fidelity. Output plain text with these exact sections: Goal, Constraints, Decisions, Open Questions, Next Actions, Critical Facts. Keep literals (paths, model ids, command names, env vars, URLs, numbers, error messages) whenever available. Include key tool results in concise form. Do not add preamble or commentary.";
 
 export async function callSummarize(
   apiKey: string,
@@ -250,11 +271,9 @@ export async function callSummarize(
     }
     const text = await res.text();
     lastError = new Error(`Summarize API ${res.status}: ${text}`);
-    if ((res.status === 429 || res.status === 503) && attempt < MAX_RETRIES) {
+    if (RETRYABLE_STATUS.has(res.status) && attempt < MAX_RETRIES) {
       const retryAfter = res.headers.get("retry-after");
-      const waitMs = retryAfter
-        ? Math.max(1000, parseInt(retryAfter, 10) * 1000)
-        : INITIAL_BACKOFF_MS * Math.pow(2, attempt);
+      const waitMs = computeRetryDelayMs(attempt, retryAfter);
       await sleep(waitMs);
       continue;
     }
