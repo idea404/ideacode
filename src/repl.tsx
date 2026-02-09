@@ -332,45 +332,6 @@ function orbitDots(frame: number): string {
     .join("");
 }
 
-const LoadingStatus = React.memo(function LoadingStatus({
-  active,
-  label,
-}: {
-  active: boolean;
-  label: string;
-}) {
-  const [frame, setFrame] = useState(0);
-  const startedAtRef = useRef<number | null>(null);
-
-  useEffect(() => {
-    if (!active) {
-      startedAtRef.current = null;
-      return;
-    }
-    if (startedAtRef.current == null) {
-      startedAtRef.current = Date.now();
-      setFrame(0);
-    }
-    const anim = setInterval(() => setFrame((n) => n + 1), LOADING_TICK_MS);
-    return () => {
-      clearInterval(anim);
-    };
-  }, [active]);
-
-  if (!active) return <Text color={inkColors.textSecondary}>{"\u00A0"}</Text>;
-  const startedAt = startedAtRef.current ?? Date.now();
-  const elapsedSeconds = Math.max(0, (Date.now() - startedAt) / 1000);
-  const elapsedText =
-    elapsedSeconds < 10 ? `${elapsedSeconds.toFixed(1)}s` : `${Math.floor(elapsedSeconds)}s`;
-
-  return (
-    <Text color={inkColors.textSecondary}>
-      {" "}
-      {orbitDots(frame)} {colors.gray(label)} {colors.gray(elapsedText)}
-    </Text>
-  );
-});
-
 export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
   const { rows: termRows, columns: termColumns } = useTerminalSize();
   // Big ASCII art logo for ideacode
@@ -473,6 +434,10 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
 
   const [loading, setLoading] = useState(false);
   const [loadingLabel, setLoadingLabel] = useState("Thinking…");
+  const loadingActiveRef = useRef(false);
+  const loadingLabelRef = useRef(loadingLabel);
+  const loadingFooterLinesRef = useRef(2);
+  const loadingRenderRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const cursorBlinkOn = true;
   const [showPalette, setShowPalette] = useState(false);
   const [paletteIndex, setPaletteIndex] = useState(0);
@@ -499,6 +464,57 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       process.stdout.write("\x1b[?1006l\x1b[?1000l");
     };
   }, []);
+
+  useEffect(() => {
+    loadingActiveRef.current = loading;
+    loadingLabelRef.current = loadingLabel;
+    if (!process.stdout.isTTY) return;
+
+    const clearLoadingLine = () => {
+      const up = Math.max(1, loadingFooterLinesRef.current);
+      try {
+        writeSync(process.stdout.fd, `\x1b7\x1b[${up}A\r\x1b[2K\x1b8`);
+      } catch {
+        // Best effort only.
+      }
+    };
+
+    if (!loading) {
+      if (loadingRenderRef.current) {
+        clearInterval(loadingRenderRef.current);
+        loadingRenderRef.current = null;
+      }
+      clearLoadingLine();
+      return;
+    }
+
+    const startedAt = Date.now();
+    let frame = 0;
+    const renderTick = () => {
+      if (!loadingActiveRef.current || !process.stdout.isTTY) return;
+      const elapsedSeconds = Math.max(0, (Date.now() - startedAt) / 1000);
+      const elapsedText =
+        elapsedSeconds < 10 ? `${elapsedSeconds.toFixed(1)}s` : `${Math.floor(elapsedSeconds)}s`;
+      const line = ` ${orbitDots(frame)} ${colors.gray(loadingLabelRef.current)} ${colors.gray(elapsedText)}`;
+      const up = Math.max(1, loadingFooterLinesRef.current);
+      try {
+        writeSync(process.stdout.fd, `\x1b7\x1b[${up}A\r\x1b[2K${line}\x1b8`);
+      } catch {
+        // Best effort only.
+      }
+      frame = (frame + 1) % 6;
+    };
+
+    renderTick();
+    loadingRenderRef.current = setInterval(renderTick, LOADING_TICK_MS);
+    return () => {
+      if (loadingRenderRef.current) {
+        clearInterval(loadingRenderRef.current);
+        loadingRenderRef.current = null;
+      }
+      clearLoadingLine();
+    };
+  }, [loading, loadingLabel]);
 
   const estimatedTokens = useMemo(() => estimateTokens(messages, undefined), [messages]);
   const contextWindowK = useMemo(() => {
@@ -1488,12 +1504,13 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
   }
 
   const footerLines = suggestionBoxLines + 1 + stableInputLineCount;
+  loadingFooterLinesRef.current = footerLines;
   return (
     <Box flexDirection="column" height={termRows} overflow="hidden">
       <Box flexDirection="column" flexGrow={1} minHeight={0} overflow="hidden">
         <LogViewport lines={visibleLogLines} startIndex={logStartIndex} height={logViewportHeight} />
         <Box flexDirection="row" marginTop={1} marginBottom={0}>
-          <LoadingStatus active={loading} label={loadingLabel} />
+          <Text color={inkColors.textSecondary}>{"\u00A0"}</Text>
         </Box>
       </Box>
       <Box flexDirection="column" flexShrink={0} height={footerLines}>
