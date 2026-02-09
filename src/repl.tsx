@@ -829,6 +829,13 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
 
         const runParallelBatch = async (batch: PlannedToolCall[]): Promise<void> => {
           if (batch.length === 0) return;
+          if (batch.length === 1) {
+            const planned = batch[0]!;
+            setLoadingLabel(`Running ${planned.toolName}…`);
+            const result = await runTool(planned.toolName, planned.toolArgs);
+            renderToolOutcome(planned, result);
+            return;
+          }
           setLoadingLabel(`Running ${batch.length} tools in parallel…`);
           const started = Date.now();
           const groupedTools = Array.from(
