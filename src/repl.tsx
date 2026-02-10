@@ -228,6 +228,38 @@ function wrapLine(line: string, width: number): string[] {
   return out.length > 0 ? out : [""];
 }
 
+const BlinkingCaret = React.memo(function BlinkingCaret({
+  char,
+  onColor,
+  onBold,
+  offColor,
+  offBold,
+}: {
+  char: string;
+  onColor?: string;
+  onBold?: boolean;
+  offColor?: string;
+  offBold?: boolean;
+}) {
+  const [on, setOn] = useState(true);
+  useEffect(() => {
+    const t = setInterval(() => setOn((v) => !v), 530);
+    return () => clearInterval(t);
+  }, []);
+  if (on) {
+    return (
+      <Text inverse color={onColor} bold={onBold}>
+        {char}
+      </Text>
+    );
+  }
+  return (
+    <Text color={offColor} bold={offBold ?? onBold}>
+      {char}
+    </Text>
+  );
+});
+
 function replayMessagesToLogLines(
   messages: Array<{ role: string; content: unknown }>
 ): string[] {
@@ -476,9 +508,9 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
 
   useEffect(() => {
     // Enable SGR mouse + basic tracking so trackpad wheel scrolling works.
-    process.stdout.write("\x1b[?1006h\x1b[?1000h");
+    process.stdout.write("\x1b[?1006h\x1b[?1000h\x1b[?12h");
     return () => {
-      process.stdout.write("\x1b[?1006l\x1b[?1000l");
+      process.stdout.write("\x1b[?1006l\x1b[?1000l\x1b[?12l");
     };
   }, []);
 
@@ -1689,7 +1721,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
           <Box flexDirection="row">
             <Text color={inkColors.primary}>{icons.prompt} </Text>
             {cursorBlinkOn ? (
-              <Text inverse color={inkColors.primary}> </Text>
+              <BlinkingCaret char={"\u00A0"} onColor={inkColors.primary} offColor={inkColors.primary} />
             ) : (
               <Text color={inkColors.primary}> </Text>
             )}
@@ -1732,9 +1764,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
                       if (lineText === "" && v === 0 && cursorOnThisLine) {
                         rowNodes.push(cursorBlinkOn
                           ? (
-                            <Text key="cursor-empty-on" inverse color={inkColors.primary}>
-                              {"\u00A0"}
-                            </Text>
+                            <BlinkingCaret key="cursor-empty-on" char={"\u00A0"} onColor={inkColors.primary} offColor={inkColors.primary} />
                           )
                           : (
                             <Text key="cursor-empty-off" color={inkColors.primary}>
@@ -1754,9 +1784,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
                         rowNodes.push(<Text key="plain-before">{before}</Text>);
                         rowNodes.push(cursorBlinkOn
                           ? (
-                            <Text key="plain-caret-on" inverse color={inkColors.primary}>
-                              {curChar}
-                            </Text>
+                            <BlinkingCaret key="plain-caret-on" char={curChar} onColor={inkColors.primary} />
                           )
                           : (
                             <Text key="plain-caret-off">{curChar}</Text>
@@ -1860,9 +1888,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
                     if (lineText === "" && v === 0 && cursorOnThisLine) {
                       lineNodes.push(cursorBlinkOn
                         ? (
-                          <Text key="cursor-on" inverse color={inkColors.primary}>
-                            {"\u00A0"}
-                          </Text>
+                          <BlinkingCaret key="cursor-on" char={"\u00A0"} onColor={inkColors.primary} offColor={inkColors.primary} />
                         )
                         : (
                           <Text key="cursor-off" color={inkColors.primary}>
@@ -1889,14 +1915,14 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
                             lineNodes.push(<Text key={`${segIdx}-a`} {...seg.style}>{before}</Text>);
                             if (cursorBlinkOn) {
                               lineNodes.push(
-                                <Text
+                                <BlinkingCaret
                                   key={`${segIdx}-b-on`}
-                                  inverse
-                                  color={usePath ? inkColors.path : inkColors.primary}
-                                  bold={"bold" in seg.style && !!seg.style.bold}
-                                >
-                                  {curChar}
-                                </Text>
+                                  char={curChar}
+                                  onColor={usePath ? inkColors.path : inkColors.primary}
+                                  onBold={"bold" in seg.style && !!seg.style.bold}
+                                  offColor={"color" in seg.style ? seg.style.color : undefined}
+                                  offBold={"bold" in seg.style ? !!seg.style.bold : undefined}
+                                />
                               );
                             } else {
                               lineNodes.push(
@@ -1917,9 +1943,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
                       if (cursorPosInVisual >= 0 && !cursorRendered) {
                         lineNodes.push(cursorBlinkOn
                           ? (
-                            <Text key="cursor-end-on" inverse color={inkColors.primary}>
-                              {"\u00A0"}
-                            </Text>
+                            <BlinkingCaret key="cursor-end-on" char={"\u00A0"} onColor={inkColors.primary} offColor={inkColors.primary} />
                           )
                           : (
                             <Text key="cursor-end-off" color={inkColors.primary}>
