@@ -12,4 +12,5 @@ export {
   bashOutputLine,
   renderMarkdown,
   header,
+  expandLogLinesToVisual,
 } from "./format.js";

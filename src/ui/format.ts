@@ -57,6 +57,77 @@ function splitRenderedLines(rendered: string): string[] {
   return rendered.split("\n").map((l) => l.replace(/[ \t]+$/g, ""));
 }
 
+const ANSI_SGR = /^\x1b\[[0-9;]*m/;
+
+/**
+ * Split one logical log line into rows of at most `maxWidth` visible characters (ANSI excluded from width).
+ * Ensures one Ink Text row ≈ one terminal row so wrapped markdown/tables don’t overlap when scrolling.
+ */
+function breakLongAnsiLine(line: string, maxWidth: number): string[] {
+  if (maxWidth < 8) return [line];
+  if (stripAnsi(line).length <= maxWidth) return [line];
+
+  const rows: string[] = [];
+  let pos = 0;
+  const s = line;
+
+  while (pos < s.length) {
+    let vis = 0;
+    const rowStart = pos;
+    let j = pos;
+    let lastSpaceBreak = -1;
+
+    while (j < s.length) {
+      if (s[j] === "\x1b") {
+        const m = s.slice(j).match(ANSI_SGR);
+        if (m) {
+          j += m[0].length;
+          continue;
+        }
+        j += 1;
+        continue;
+      }
+      const ch = s[j]!;
+      if (vis + 1 > maxWidth) break;
+      if (/\s/.test(ch)) lastSpaceBreak = j + 1;
+      vis += 1;
+      j += 1;
+    }
+
+    let breakAt = j;
+    if (breakAt === rowStart) {
+      const m = s.slice(pos).match(ANSI_SGR);
+      if (m) {
+        pos += m[0].length;
+        continue;
+      }
+      breakAt = Math.min(s.length, rowStart + 1);
+    } else if (lastSpaceBreak > rowStart && lastSpaceBreak >= rowStart + Math.floor((breakAt - rowStart) * 0.35)) {
+      breakAt = lastSpaceBreak;
+    }
+
+    rows.push(s.slice(rowStart, breakAt).replace(/[ \t]+$/g, ""));
+    pos = breakAt;
+    while (pos < s.length && (s[pos] === " " || s[pos] === "\t")) pos += 1;
+  }
+
+  return rows.length > 0 ? rows : [line];
+}
+
+/** Flatten logical log lines to one string per terminal row at the current column width. */
+export function expandLogLinesToVisual(lines: string[], maxWidth: number): string[] {
+  if (maxWidth < 8) return [...lines];
+  const out: string[] = [];
+  for (const line of lines) {
+    if (line === "") {
+      out.push("");
+      continue;
+    }
+    out.push(...breakLongAnsiLine(line, maxWidth));
+  }
+  return out;
+}
+
 function renderInlineTokens(tokens: AnyToken[] | undefined): string {
   if (!tokens || tokens.length === 0) return "";
   return tokens

@@ -15,6 +15,10 @@ export const COMMANDS: Command[] = [
   { cmd: "/help", desc: "Show help", aliases: ["/?"] },
   { cmd: "/palette", desc: "Command palette", aliases: ["/p"] },
   { cmd: "/clear", desc: "Clear conversation", aliases: ["/c"]  },
+  {
+    cmd: "/compress",
+    desc: "Summarize older turns to fit ~30% of model context (for smaller models)",
+  },
   { cmd: "/status", desc: "Show session info" },
   { cmd: "/q", desc: "Quit", aliases: ["/exit", "/quit", "exit"] },
 ];
