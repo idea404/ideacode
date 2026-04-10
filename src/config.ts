@@ -17,6 +17,8 @@ export type StoredConfig = {
   apiKey?: string;
   model?: string;
   braveSearchApiKey?: string;
+  /** Persisted active chat id (conversations/chats/<id>.json). */
+  activeChatId?: string;
 };
 
 function loadConfigFile(): StoredConfig {
@@ -72,10 +74,24 @@ export function saveModel(model: string): void {
   saveConfigFile(config);
 }
 
+export function getActiveChatId(): string | undefined {
+  const id = loadConfigFile().activeChatId?.trim();
+  return id || undefined;
+}
+
+export function saveActiveChatId(chatId: string): void {
+  const config = loadConfigFile();
+  config.activeChatId = chatId || undefined;
+  saveConfigFile(config);
+}
+
 export const config = {
   apiUrl: "https://openrouter.ai/api/v1/messages",
   chatCompletionsUrl: "https://openrouter.ai/api/v1/chat/completions",
   modelsUrl: "https://openrouter.ai/api/v1/models",
+  keyInfoUrl: "https://openrouter.ai/api/v1/key",
+  /** Account credits (may require a management key; 403 with normal keys is OK). */
+  creditsUrl: "https://openrouter.ai/api/v1/credits",
   get apiKey() {
     return getApiKey();
   },

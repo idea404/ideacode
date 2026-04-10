@@ -43,7 +43,8 @@
     "ora": "^9.1.0",
     "patch-package": "^8.0.0",
     "playwright": "^1.49.0",
-    "react": "^18.3.1"
+    "react": "^18.3.1",
+    "wrap-ansi": "^9.0.2"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

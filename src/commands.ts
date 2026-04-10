@@ -10,16 +10,20 @@ export type Command = {
 };
 
 export const COMMANDS: Command[] = [
+  { cmd: "/chats", desc: "Pick saved chat", aliases: ["/chat"] },
+  { cmd: "/new", desc: "Start new chat", aliases: ["/new-session"] },
+  { cmd: "/rename", desc: "Rename this chat (optional: /rename title)" },
+  { cmd: "/delete", desc: "Delete this chat" },
   { cmd: "/models", desc: "Switch model", aliases: ["/model"] },
   { cmd: "/brave", desc: "Set Brave Search API key", aliases: ["/brave-key"] },
   { cmd: "/help", desc: "Show help", aliases: ["/?"] },
   { cmd: "/palette", desc: "Command palette", aliases: ["/p"] },
-  { cmd: "/clear", desc: "Clear conversation", aliases: ["/c"]  },
+  { cmd: "/clear", desc: "Clear conversation", aliases: ["/c"] },
   {
     cmd: "/compress",
     desc: "Summarize older turns to fit ~30% of model context (for smaller models)",
   },
-  { cmd: "/status", desc: "Show session info" },
+  { cmd: "/status", desc: "Show chat, model, cwd, and message count" },
   { cmd: "/q", desc: "Quit", aliases: ["/exit", "/quit", "exit"] },
 ];
 
@@ -35,6 +39,21 @@ export function resolveCommand(input: string): string | null {
   const key = input.trim().toLowerCase();
   if (!key) return null;
   return aliasToCanonical.get(key) ?? null;
+}
+
+/** Exact command match, or first token (e.g. `/rename My title` → canonical `/rename`, rest `My title`). */
+export function resolveSlashCommand(input: string): { canonical: string | null; rest: string } {
+  const trimmed = input.trim();
+  if (!trimmed) return { canonical: null, rest: "" };
+  const exact = resolveCommand(trimmed);
+  if (exact) return { canonical: exact, rest: "" };
+  const sp = trimmed.search(/\s/);
+  if (sp <= 0) return { canonical: null, rest: "" };
+  const head = trimmed.slice(0, sp).trim().toLowerCase();
+  const tail = trimmed.slice(sp).trim();
+  const canon = aliasToCanonical.get(head);
+  if (canon) return { canonical: canon, rest: tail };
+  return { canonical: null, rest: "" };
 }
 
 export function matchCommand(filter: string, c: Command): boolean {

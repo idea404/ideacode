@@ -2,6 +2,7 @@ import { marked } from "marked";
 import Table from "cli-table3";
 import chalk from "chalk";
 import boxen from "boxen";
+import wrapAnsi from "wrap-ansi";
 import { colors, icons, theme, inkColors } from "./theme.js";
 
 const hrLine = () => {
@@ -57,61 +58,70 @@ function splitRenderedLines(rendered: string): string[] {
   return rendered.split("\n").map((l) => l.replace(/[ \t]+$/g, ""));
 }
 
-const ANSI_SGR = /^\x1b\[[0-9;]*m/;
+/**
+ * Inline markdown can embed `\n` (GFM breaks, `<br>`, soft breaks in blockquotes). Those must become
+ * separate log rows *before* block-level styling (e.g. `│` quotes); otherwise `appendLog` splits on `\n`
+ * mid-string and breaks ANSI sequences and quote bars.
+ */
+function expandEmbeddedNewlinesToRows(s: string): string[] {
+  const rows: string[] = [];
+  for (const part of s.split("\n")) {
+    const row = part.replace(/[ \t]+$/g, "");
+    if (row.trim().length > 0) rows.push(row);
+  }
+  return rows;
+}
 
 /**
- * Split one logical log line into rows of at most `maxWidth` visible characters (ANSI excluded from width).
- * Ensures one Ink Text row ≈ one terminal row so wrapped markdown/tables don’t overlap when scrolling.
+ * Blockquote log rows are `│␠␠` + styled body (two spaces after the bar). That pattern avoids matching table lines like `│ Name`.
+ * When wrap-ansi breaks a long quote, only the first visual row included the gutter; continuations must repeat the same prefix.
+ */
+const BLOCKQUOTE_GUTTER_STRIP = /^│\s{2,}/;
+
+function splitBlockquoteGutter(line: string): { prefix: string; body: string } | null {
+  const stripped = stripAnsi(line);
+  const m = stripped.match(BLOCKQUOTE_GUTTER_STRIP);
+  if (!m) return null;
+  const gutterVisLen = m[0].length;
+  let vis = 0;
+  let i = 0;
+  while (i < line.length && vis < gutterVisLen) {
+    if (line.charCodeAt(i) === 0x1b) {
+      const mm = line.slice(i).match(/^\x1b\[[0-9;]*m/);
+      if (mm) {
+        i += mm[0].length;
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+    const cp = line.codePointAt(i)!;
+    i += cp > 0xffff ? 2 : 1;
+    vis += 1;
+  }
+  if (vis < gutterVisLen) return null;
+  return { prefix: line.slice(0, i), body: line.slice(i) };
+}
+
+/**
+ * Split one logical log line for the log viewport. Uses the same algorithm as Ink’s final pass
+ * (`wrap-ansi`, `hard: true`, `trim: false`) so lines are not wrapped twice with different rules —
+ * that mismatch produced stray words on their own rows near sentence ends.
  */
 function breakLongAnsiLine(line: string, maxWidth: number): string[] {
   if (maxWidth < 8) return [line];
-  if (stripAnsi(line).length <= maxWidth) return [line];
+  if (line === "") return [line];
 
-  const rows: string[] = [];
-  let pos = 0;
-  const s = line;
-
-  while (pos < s.length) {
-    let vis = 0;
-    const rowStart = pos;
-    let j = pos;
-    let lastSpaceBreak = -1;
-
-    while (j < s.length) {
-      if (s[j] === "\x1b") {
-        const m = s.slice(j).match(ANSI_SGR);
-        if (m) {
-          j += m[0].length;
-          continue;
-        }
-        j += 1;
-        continue;
-      }
-      const ch = s[j]!;
-      if (vis + 1 > maxWidth) break;
-      if (/\s/.test(ch)) lastSpaceBreak = j + 1;
-      vis += 1;
-      j += 1;
-    }
-
-    let breakAt = j;
-    if (breakAt === rowStart) {
-      const m = s.slice(pos).match(ANSI_SGR);
-      if (m) {
-        pos += m[0].length;
-        continue;
-      }
-      breakAt = Math.min(s.length, rowStart + 1);
-    } else if (lastSpaceBreak > rowStart && lastSpaceBreak >= rowStart + Math.floor((breakAt - rowStart) * 0.35)) {
-      breakAt = lastSpaceBreak;
-    }
-
-    rows.push(s.slice(rowStart, breakAt).replace(/[ \t]+$/g, ""));
-    pos = breakAt;
-    while (pos < s.length && (s[pos] === " " || s[pos] === "\t")) pos += 1;
+  const bq = splitBlockquoteGutter(line);
+  if (bq && bq.body.length > 0) {
+    const prefixW = visibleLen(bq.prefix);
+    const innerMax = Math.max(8, maxWidth - prefixW);
+    const wrapped = wrapAnsi(bq.body, innerMax, { trim: false, hard: true });
+    return splitRenderedLines(wrapped).map((piece) => bq.prefix + piece);
   }
 
-  return rows.length > 0 ? rows : [line];
+  const wrapped = wrapAnsi(line, maxWidth, { trim: false, hard: true });
+  return splitRenderedLines(wrapped);
 }
 
 /** Flatten logical log lines to one string per terminal row at the current column width. */
@@ -164,7 +174,7 @@ function headingRule(text: string): string {
 function renderHeading(token: AnyToken): string[] {
   const depth = token.depth ?? 2;
   const headingText = renderInlineTokens(token.tokens) || token.text || "";
-  const clean = headingText.trim();
+  const clean = expandEmbeddedNewlinesToRows(headingText.trim()).join(" ").trim();
   if (!clean) return [];
 
   if (depth <= 1) {
@@ -277,11 +287,15 @@ function renderList(token: AnyToken, indent: number): string[] {
     const item = items[i] ?? {};
     const marker = ordered ? `${start + i}.` : "•";
     const itemLines = renderBlockTokens(item.tokens ?? [], indent + 2, true);
-    const first = (itemLines[0] ?? "").trimStart();
+    const flattened: string[] = [];
+    for (const L of itemLines) {
+      flattened.push(...expandEmbeddedNewlinesToRows(L));
+    }
+    const first = (flattened[0] ?? "").trimStart();
     out.push(`${" ".repeat(indent)}${marker} ${first}`.trimEnd());
     const continuationPrefix = " ".repeat(indent + marker.length + 1);
-    for (let j = 1; j < itemLines.length; j++) {
-      out.push(`${continuationPrefix}${itemLines[j] ?? ""}`.trimEnd());
+    for (let j = 1; j < flattened.length; j++) {
+      out.push(`${continuationPrefix}${flattened[j] ?? ""}`.trimEnd());
     }
   }
 
@@ -302,13 +316,24 @@ function renderBlockTokens(tokens: AnyToken[], indent = 0, compact = false): str
     }
     if (t === "paragraph" || t === "text") {
       const line = renderInlineTokens(token.tokens ?? [{ type: "text", text: token.text ?? "" }]);
-      if (line.trim()) out.push(`${" ".repeat(indent)}${line}`.trimEnd());
+      if (!line.trim()) {
+        if (!compact) out.push("");
+        continue;
+      }
+      for (const row of expandEmbeddedNewlinesToRows(line)) {
+        out.push(`${" ".repeat(indent)}${row}`.trimEnd());
+      }
       if (!compact) out.push("");
       continue;
     }
     if (t === "blockquote") {
       const inner = renderBlockTokens(token.tokens ?? [], indent + 2, true);
-      for (const line of inner) out.push(`${colors.muted("│")} ${colors.muted(line)}`.trimEnd());
+      for (const line of inner) {
+        for (const row of expandEmbeddedNewlinesToRows(line)) {
+          // Two spaces after │ so wrapped continuations can detect the gutter (see splitBlockquoteGutter).
+          out.push(`${colors.muted("│")}  ${colors.muted(row)}`.trimEnd());
+        }
+      }
       if (!compact) out.push("");
       continue;
     }
@@ -331,7 +356,9 @@ function renderBlockTokens(tokens: AnyToken[], indent = 0, compact = false): str
     }
     const fallback = (token.text ?? token.raw ?? "").trim();
     if (fallback) {
-      out.push(`${" ".repeat(indent)}${fallback}`);
+      for (const row of expandEmbeddedNewlinesToRows(fallback)) {
+        out.push(`${" ".repeat(indent)}${row}`);
+      }
       if (!compact) out.push("");
     }
   }
@@ -342,7 +369,9 @@ function renderBlockTokens(tokens: AnyToken[], indent = 0, compact = false): str
 
 export function renderMarkdown(text: string): string {
   const normalized = preprocessMarkdown(text);
-  const tokens = marked.lexer(normalized, { gfm: true, breaks: true }) as AnyToken[];
+  // `breaks: false` (CommonMark): a single newline inside a paragraph is a space, not <br>.
+  // Models often hard-wrap at ~80 cols; `breaks: true` turned every wrap into a line break and stranded words.
+  const tokens = marked.lexer(normalized, { gfm: true, breaks: false }) as AnyToken[];
   const lines = renderBlockTokens(tokens, 0, false)
     .join("\n")
     .replace(/\n{3,}/g, "\n\n")

@@ -11,10 +11,22 @@ import gradient from "gradient-string";
 
 // Custom matcha-themed gradient: matcha green → dark sepia
 const matchaGradient = gradient(["#7F9A65", "#5C4033"]);
-import { getModel, saveModel, saveBraveSearchApiKey, getBraveSearchApiKey } from "./config.js";
-import { loadConversation, saveConversation } from "./conversation.js";
+import { getModel, saveModel, saveBraveSearchApiKey, getBraveSearchApiKey, saveActiveChatId } from "./config.js";
+import {
+  createNewChat,
+  deleteChatFile,
+  firstUserTextSnippet,
+  formatChatRelativeTime,
+  listChatSummaries,
+  loadChatRecord,
+  resolveActiveChatIdOnStartup,
+  saveChatMessages,
+  saveChatRecord,
+  type ChatRecord,
+  type ChatSummary,
+} from "./chats.js";
 import type { ContentBlock, OpenRouterModel } from "./api.js";
-import { callApi, fetchModels } from "./api.js";
+import { callApi, fetchKeyCreditsRemaining, fetchModels } from "./api.js";
 import { getVersion, checkForUpdate } from "./version.js";
 import {
   estimateTokens,
@@ -25,7 +37,7 @@ import {
   sanitizeMessagesForApi,
 } from "./context.js";
 import { runTool } from "./tools/index.js";
-import { COMMANDS, matchCommand, resolveCommand } from "./commands.js";
+import { COMMANDS, matchCommand, resolveSlashCommand } from "./commands.js";
 import {
   colors,
   icons,
@@ -384,34 +396,52 @@ function orbitDots(frame: number): string {
     .join("");
 }
 
-export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
-  const { rows: termRows, columns: termColumns } = useTerminalSize();
-  // Big ASCII art logo for ideacode
-  const bigLogo = `
+const BANNER_LOGO = `
   ██╗██████╗ ███████╗ █████╗  ██████╗ ██████╗ ██████╗ ███████╗
   ██║██╔══██╗██╔════╝██╔══██╗██╔════╝██╔═══██╗██╔══██╗██╔════╝
   ██║██║  ██║█████╗  ███████║██║     ██║   ██║██║  ██║█████╗  
   ██║██║  ██║██╔══╝  ██╔══██║██║     ██║   ██║██║  ██║██╔══╝  
   ██║██████╔╝███████╗██║  ██║╚██████╗╚██████╔╝██████╔╝███████╗
   ╚═╝╚═════╝ ╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝
-  `;
+`;
 
-  const hasRestoredLogRef = useRef(false);
-  const restoredCwdRef = useRef<string | null>(null);
+/** Strip only outer newlines — `.trim()` would eat the first line’s leading spaces after the opening `\n`. */
+function trimBannerNewlines(s: string): string {
+  return s.replace(/^\r?\n+/, "").replace(/\r?\n+$/, "");
+}
+
+/** One log row per line — Ink multi-line <Text> collapses leading spaces on rows after the first. */
+function bannerLogoLines(): string[] {
+  return matchaGradient(trimBannerNewlines(BANNER_LOGO)).split("\n");
+}
+
+export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
+  const { rows: termRows, columns: termColumns } = useTerminalSize();
+
+  const initialChatBootstrapRef = useRef<{ id: string; record: ChatRecord } | null>(null);
+  if (initialChatBootstrapRef.current === null) {
+    initialChatBootstrapRef.current = resolveActiveChatIdOnStartup(cwd);
+  }
+  const chatBoot = initialChatBootstrapRef.current;
+
+  const [activeChatId, setActiveChatId] = useState(() => chatBoot!.id);
+  const activeChatIdRef = useRef(chatBoot!.id);
+  useEffect(() => {
+    activeChatIdRef.current = activeChatId;
+  }, [activeChatId]);
+
   const [logLines, setLogLines] = useState<string[]>(() => {
     const model = getModel();
     const version = getVersion();
     const banner = [
       "",
-      matchaGradient(bigLogo),
+      ...bannerLogoLines(),
       colors.accent(`  ideacode v${version}`) + colors.dim(" · ") + colors.accentPale(model) + colors.dim(" · ") + colors.bold("OpenRouter") + colors.dim(` · ${cwd}`),
       colors.mutedDark("  / commands  ! shell  @ files · Ctrl+P palette · Ctrl+C or /q to quit"),
       "",
     ];
-    const loaded = loadConversation(cwd);
+    const loaded = chatBoot!.record.messages;
     if (loaded.length > 0) {
-      hasRestoredLogRef.current = true;
-      restoredCwdRef.current = cwd;
       return [...banner, ...replayMessagesToLogLines(loaded)];
     }
     return banner;
@@ -422,51 +452,39 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
   }, [logLines]);
   const [inputDraft, setInputDraft] = useState<InputDraft>({ value: "", cursor: 0 });
   const [currentModel, setCurrentModel] = useState(getModel);
-  const [messages, setMessages] = useState<Array<{ role: string; content: unknown }>>(() =>
-    loadConversation(cwd)
+  const [messages, setMessages] = useState<Array<{ role: string; content: unknown }>>(
+    () => chatBoot!.record.messages
   );
   const messagesRef = useRef(messages);
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
 
-  useEffect(() => {
-    if (hasRestoredLogRef.current && restoredCwdRef.current === cwd) return;
-    const loaded = loadConversation(cwd);
-    const model = getModel();
-    const version = getVersion();
-    const banner = [
-      "",
-      matchaGradient(bigLogo),
-      colors.accent(`  ideacode v${version}`) + colors.dim(" · ") + colors.accent(model) + colors.dim(" · ") + colors.accentPale("OpenRouter") + colors.dim(` · ${cwd}`),
-      colors.mutedDark("  / commands  ! shell  @ files · Ctrl+P palette · Ctrl+C or /q to quit"),
-      "",
-    ];
-    if (loaded.length > 0) {
-      hasRestoredLogRef.current = true;
-      setLogLines([...banner, ...replayMessagesToLogLines(loaded)]);
-    } else {
-      hasRestoredLogRef.current = false;
-      setLogLines(banner);
+  const saveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const flushChatSave = useCallback(() => {
+    if (saveDebounceRef.current) {
+      clearTimeout(saveDebounceRef.current);
+      saveDebounceRef.current = null;
     }
-    restoredCwdRef.current = cwd;
+    const id = activeChatIdRef.current;
+    saveChatMessages(id, messagesRef.current, loadChatRecord(id), cwd);
   }, [cwd]);
 
-  const saveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
     saveDebounceRef.current = setTimeout(() => {
       saveDebounceRef.current = null;
-      saveConversation(cwd, messages);
+      const id = activeChatIdRef.current;
+      saveChatMessages(id, messages, loadChatRecord(id), cwd);
     }, 500);
     return () => {
       if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
     };
-  }, [cwd, messages]);
+  }, [messages, cwd]);
 
   const handleQuit = useCallback(() => {
-    if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
-    saveConversation(cwd, messagesRef.current);
+    flushChatSave();
     // Best-effort terminal mode reset in case process exits before React cleanup runs.
     try {
       if (process.stdin.isTTY && typeof process.stdin.setRawMode === "function") {
@@ -482,9 +500,10 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       // Ignore restore failures during teardown.
     }
     onQuit(logLinesRef.current);
-  }, [cwd, onQuit]);
+  }, [flushChatSave, onQuit]);
 
   const [loading, setLoading] = useState(false);
+  const [keyCreditsFooter, setKeyCreditsFooter] = useState("…");
   const [loadingLabel, setLoadingLabel] = useState("Thinking…");
   const loadingActiveRef = useRef(false);
   const loadingLabelRef = useRef(loadingLabel);
@@ -509,6 +528,38 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
   const queuedMessageRef = useRef<string | null>(null);
   const lastUserMessageRef = useRef<string>("");
   const [logScrollOffset, setLogScrollOffset] = useState(0);
+
+  const applyChatRecord = useCallback(
+    (record: ChatRecord, resetScroll = true) => {
+      flushChatSave();
+      activeChatIdRef.current = record.id;
+      saveActiveChatId(record.id);
+      setActiveChatId(record.id);
+      setMessages(record.messages);
+      const model = getModel();
+      const version = getVersion();
+      const banner = [
+        "",
+        ...bannerLogoLines(),
+        colors.accent(`  ideacode v${version}`) + colors.dim(" · ") + colors.accentPale(model) + colors.dim(" · ") + colors.bold("OpenRouter") + colors.dim(` · ${cwd}`),
+        colors.mutedDark("  / commands  ! shell  @ files · Ctrl+P palette · Ctrl+C or /q to quit"),
+        "",
+      ];
+      setLogLines(
+        record.messages.length > 0 ? [...banner, ...replayMessagesToLogLines(record.messages)] : banner
+      );
+      if (resetScroll) setLogScrollOffset(0);
+    },
+    [cwd, flushChatSave]
+  );
+
+  const [showChatSelector, setShowChatSelector] = useState(false);
+  const [chatSummariesForPicker, setChatSummariesForPicker] = useState<ChatSummary[]>([]);
+  const [chatPickerIndex, setChatPickerIndex] = useState(0);
+  const [chatSearchFilter, setChatSearchFilter] = useState("");
+  const [showRenameChatModal, setShowRenameChatModal] = useState(false);
+  const [renameChatInput, setRenameChatInput] = useState("");
+
   const scrollBoundsRef = useRef({ maxLogScrollOffset: 0, logViewportHeight: 1 });
   /** One entry per terminal row after hard-wrapping (avoids Ink multi-row overlap in the log viewport). */
   const visualLogLines = useMemo(
@@ -598,6 +649,14 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         (m.name ?? "").toLowerCase().includes(q)
     );
   }, [modelList, modelSearchFilter]);
+
+  const filteredChatList = useMemo(() => {
+    const q = chatSearchFilter.trim().toLowerCase();
+    if (!q) return chatSummariesForPicker;
+    return chatSummariesForPicker.filter(
+      (s) => s.title.toLowerCase().includes(q) || s.id.toLowerCase().includes(q)
+    );
+  }, [chatSummariesForPicker, chatSearchFilter]);
 
   const wrapWidth = Math.max(10, termColumns - PROMPT_INDENT_LEN - 2);
   const inputLineCount = useMemo(() => {
@@ -700,6 +759,38 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
     if (apiKey) fetchModels(apiKey).then(setModelList);
   }, [apiKey]);
 
+  const refreshKeyCredits = useCallback(async () => {
+    if (!apiKey.trim()) {
+      setKeyCreditsFooter("—");
+      return;
+    }
+    const usd = await fetchKeyCreditsRemaining(apiKey);
+    if (usd === null) {
+      setKeyCreditsFooter("—");
+      return;
+    }
+    setKeyCreditsFooter(
+      new Intl.NumberFormat("en-US", {
+        style: "currency",
+        currency: "USD",
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      }).format(usd)
+    );
+  }, [apiKey]);
+
+  useEffect(() => {
+    void refreshKeyCredits();
+  }, [refreshKeyCredits]);
+
+  const prevLoadingRef = useRef(loading);
+  useEffect(() => {
+    if (prevLoadingRef.current && !loading) {
+      void refreshKeyCredits();
+    }
+    prevLoadingRef.current = loading;
+  }, [loading, refreshKeyCredits]);
+
   useEffect(() => {
     if (showModelSelector) {
       setModelSearchFilter("");
@@ -711,6 +802,19 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
     if (showModelSelector && filteredModelList.length > 0)
       setModelIndex((i) => Math.min(i, filteredModelList.length - 1));
   }, [showModelSelector, filteredModelList.length]);
+
+  useEffect(() => {
+    if (showChatSelector) {
+      setChatSearchFilter("");
+      setChatPickerIndex(0);
+    }
+  }, [showChatSelector]);
+
+  useEffect(() => {
+    if (showChatSelector && filteredChatList.length > 0) {
+      setChatPickerIndex((i) => Math.min(i, filteredChatList.length - 1));
+    }
+  }, [showChatSelector, filteredChatList.length]);
 
   const showSlashSuggestions = inputDraft.value.startsWith("/");
   const filteredSlashCommands = useMemo(() => {
@@ -811,6 +915,15 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
     setShowModelSelector(true);
   }, [apiKey]);
 
+  const openChatSelector = useCallback(() => {
+    setShowPalette(false);
+    setShowModelSelector(false);
+    setChatSummariesForPicker(listChatSummaries());
+    setChatSearchFilter("");
+    setChatPickerIndex(0);
+    setShowChatSelector(true);
+  }, []);
+
   const processInput = useCallback(
     async (value: string): Promise<boolean> => {
       const userInput = normalizeSubmittedInput(value);
@@ -840,7 +953,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         return true;
       }
 
-      const canonical = resolveCommand(userInput);
+      const { canonical, rest: slashRest } = resolveSlashCommand(userInput);
       if (canonical === "/q") return false;
       if (canonical === "/clear") {
         setMessages([]);
@@ -849,7 +962,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         const version = getVersion();
         const banner = [
           "",
-          matchaGradient(bigLogo),
+          ...bannerLogoLines(),
           colors.accent(`  ideacode v${version}`) + colors.dim(" · ") + colors.accentPale(model) + colors.dim(" · ") + colors.bold("OpenRouter") + colors.dim(` · ${cwd}`),
           colors.mutedDark("  / commands  ! shell  @ files · Ctrl+P palette · Ctrl+C or /q to quit"),
           "",
@@ -865,6 +978,58 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         await openModelSelector();
         return true;
       }
+      if (canonical === "/chats") {
+        openChatSelector();
+        return true;
+      }
+      if (canonical === "/new") {
+        const rec = createNewChat(cwd);
+        applyChatRecord(rec);
+        appendLog(colors.muted(`  Started new chat “${rec.title}”.`));
+        appendLog("");
+        return true;
+      }
+      if (canonical === "/rename") {
+        const rest = slashRest.trim();
+        if (rest) {
+          const id = activeChatIdRef.current;
+          const prev = loadChatRecord(id);
+          if (prev) {
+            const title = rest.slice(0, 120);
+            saveChatRecord({
+              ...prev,
+              title,
+              titleManuallySet: true,
+              updatedAt: new Date().toISOString(),
+            });
+          }
+          appendLog(colors.muted(`  Chat title set to “${rest.slice(0, 120)}”.`));
+          appendLog("");
+          return true;
+        }
+        const cur = loadChatRecord(activeChatIdRef.current);
+        setRenameChatInput(cur?.title ?? "");
+        setShowRenameChatModal(true);
+        return true;
+      }
+      if (canonical === "/delete") {
+        const id = activeChatIdRef.current;
+        flushChatSave();
+        deleteChatFile(id);
+        const rest = listChatSummaries();
+        let nextRecord: ChatRecord;
+        if (rest.length > 0) {
+          const picked = rest[0]!;
+          const rec = loadChatRecord(picked.id);
+          nextRecord = rec ?? createNewChat(cwd);
+        } else {
+          nextRecord = createNewChat(cwd);
+        }
+        applyChatRecord(nextRecord);
+        appendLog(colors.muted(`  Chat deleted. Now in “${nextRecord.title}”.`));
+        appendLog("");
+        return true;
+      }
       if (canonical === "/brave") {
         openBraveKeyModal();
         return true;
@@ -874,8 +1039,14 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         return true;
       }
       if (canonical === "/status") {
+        const rec = loadChatRecord(activeChatIdRef.current);
+        const title = rec?.title ?? "(unknown)";
+        const shortId = activeChatIdRef.current.slice(0, 8);
         appendLog(
-          colors.muted(`  ${currentModel}`) +
+          colors.muted(`  Chat: ${title}`) +
+            colors.dim(` · ${shortId}…`) +
+            colors.dim(" · ") +
+            colors.muted(`${currentModel}`) +
             colors.dim(" · ") +
             colors.accent(cwd) +
             colors.dim(` · ${messages.length} messages`)
@@ -1113,7 +1284,20 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
 
       return true;
     },
-    [apiKey, cwd, currentModel, messages, modelList, appendLog, openModelSelector, openBraveKeyModal, openHelpModal]
+    [
+      apiKey,
+      cwd,
+      currentModel,
+      messages,
+      modelList,
+      appendLog,
+      openModelSelector,
+      openChatSelector,
+      openBraveKeyModal,
+      openHelpModal,
+      flushChatSave,
+      applyChatRecord,
+    ]
   );
 
   const handleSubmit = useCallback(
@@ -1126,6 +1310,26 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       if (trimmed === "/models") {
         clearInputDraft();
         openModelSelector();
+        return;
+      }
+      if (trimmed === "/chats" || trimmed === "/chat") {
+        clearInputDraft();
+        openChatSelector();
+        return;
+      }
+      if (trimmed === "/new" || trimmed === "/new-session") {
+        clearInputDraft();
+        await processInput(trimmed);
+        return;
+      }
+      if (trimmed.startsWith("/rename")) {
+        clearInputDraft();
+        await processInput(value);
+        return;
+      }
+      if (trimmed === "/delete") {
+        clearInputDraft();
+        await processInput(trimmed);
         return;
       }
       if (trimmed === "/brave") {
@@ -1156,7 +1360,16 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         appendLog("");
       }
     },
-    [processInput, handleQuit, appendLog, openModelSelector, openBraveKeyModal, openHelpModal, clearInputDraft]
+    [
+      processInput,
+      handleQuit,
+      appendLog,
+      openModelSelector,
+      openChatSelector,
+      openBraveKeyModal,
+      openHelpModal,
+      clearInputDraft,
+    ]
   );
 
   replStdinHandlerRef.current = (input, key) => {
@@ -1178,6 +1391,33 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       setShowHelpModal(false);
       return;
     }
+    if (showRenameChatModal) {
+      if (key.return) {
+        const title = renameChatInput.trim().slice(0, 120);
+        const id = activeChatIdRef.current;
+        const prev = loadChatRecord(id);
+        if (prev && title) {
+          saveChatRecord({
+            ...prev,
+            title,
+            titleManuallySet: true,
+            updatedAt: new Date().toISOString(),
+          });
+          appendLog(colors.muted(`  Chat title set to “${title}”.`));
+          appendLog("");
+        }
+        setShowRenameChatModal(false);
+        setRenameChatInput("");
+      } else if (key.escape) {
+        setShowRenameChatModal(false);
+        setRenameChatInput("");
+      } else if (key.backspace || key.delete) {
+        setRenameChatInput((prev) => prev.slice(0, -1));
+      } else if (input && !key.ctrl && !key.meta && input !== "\b" && input !== "\x7f") {
+        setRenameChatInput((prev) => (prev + input).slice(0, 120));
+      }
+      return;
+    }
     if (showBraveKeyModal) {
       if (key.return) {
         const isPlaceholder = braveKeyInput === BRAVE_KEY_PLACEHOLDER;
@@ -1196,6 +1436,36 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         setBraveKeyInput((prev) => (prev === BRAVE_KEY_PLACEHOLDER ? "" : prev.slice(0, -1)));
       } else if (input && !key.ctrl && !key.meta && input !== "\b" && input !== "\x7f") {
         setBraveKeyInput((prev) => (prev === BRAVE_KEY_PLACEHOLDER ? input : prev + input));
+      }
+      return;
+    }
+    if (showChatSelector) {
+      if (filteredChatList.length === 0) {
+        if (key.return || key.escape) setShowChatSelector(false);
+        return;
+      }
+      if (key.upArrow) setChatPickerIndex((i) => Math.max(0, i - 1));
+      else if (key.downArrow) {
+        setChatPickerIndex((i) => Math.min(filteredChatList.length - 1, i + 1));
+      } else if (key.return) {
+        const selected = filteredChatList[chatPickerIndex];
+        if (selected) {
+          flushChatSave();
+          const rec = loadChatRecord(selected.id);
+          if (rec) {
+            applyChatRecord(rec);
+            appendLog("");
+            appendLog(colors.success(`Switched to “${rec.title}”`));
+            appendLog("");
+          }
+        }
+        setShowChatSelector(false);
+      } else if (key.escape) setShowChatSelector(false);
+      else if (key.backspace || key.delete) {
+        setChatSearchFilter((prev) => prev.slice(0, -1));
+      } else if (input && !key.ctrl && !key.meta && input !== "\b" && input !== "\x7f") {
+        setChatSearchFilter((prev) => prev + input);
+        setChatPickerIndex(0);
       }
       return;
     }
@@ -1266,6 +1536,10 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
             openModelSelector();
             return;
           }
+          if (selected.cmd === "/chats") {
+            openChatSelector();
+            return;
+          }
           if (selected.cmd === "/brave") {
             openBraveKeyModal();
             return;
@@ -1324,7 +1598,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         }
       }
     }
-      if (!showModelSelector && !showPalette) {
+      if (!showModelSelector && !showPalette && !showChatSelector && !showRenameChatModal) {
       const inputNow = inputDraftRef.current.value;
       const cursorNow = inputDraftRef.current.cursor;
       const withModifier = key.ctrl || key.meta || key.shift;
@@ -1526,6 +1800,76 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
   const footerLines = isInputLayoutFrozen ? frozenFooterLines : calculatedFooterLines;
   loadingFooterLinesRef.current = footerLines;
 
+  if (showChatSelector) {
+    const chatModalMaxHeight = 18;
+    const chatModalWidth = 118;
+    const chatModalHeight = Math.min(Math.max(filteredChatList.length, 1) + 4, chatModalMaxHeight);
+    const topPad = Math.max(0, Math.floor((termRows - chatModalHeight) / 2));
+    const leftPad = Math.max(0, Math.floor((termColumns - chatModalWidth) / 2));
+    const visibleChatCount =
+      filteredChatList.length === 0
+        ? 1
+        : Math.min(filteredChatList.length, chatModalHeight - 4);
+    const chatScrollOffset =
+      filteredChatList.length === 0
+        ? 0
+        : Math.max(
+            0,
+            Math.min(
+              chatPickerIndex - Math.floor(visibleChatCount / 2),
+              filteredChatList.length - visibleChatCount
+            )
+          );
+    const visibleChats = filteredChatList.slice(chatScrollOffset, chatScrollOffset + visibleChatCount);
+    return (
+      <Box flexDirection="column" height={termRows} overflow="hidden">
+        <Box height={topPad} />
+        <Box flexDirection="row">
+          <Box width={leftPad} />
+          <Box
+            flexDirection="column"
+            borderStyle="single"
+            borderColor={inkColors.primary}
+            paddingX={2}
+            paddingY={1}
+            width={chatModalWidth}
+            minHeight={chatModalHeight}
+          >
+            <Text bold> Select chat </Text>
+            <Box flexDirection="row">
+              <Text color={inkColors.textSecondary}> Filter: </Text>
+              <Text>{chatSearchFilter || " "}</Text>
+              {chatSearchFilter.length > 0 && (
+                <Text color={inkColors.textDisabled}>
+                  {" "}({filteredChatList.length} match{filteredChatList.length !== 1 ? "es" : ""})
+                </Text>
+              )}
+            </Box>
+            {filteredChatList.length === 0 ? (
+              <Text color={inkColors.textSecondary}> No chats match this filter </Text>
+            ) : (
+              visibleChats.map((s, i) => {
+                const actualIndex = chatScrollOffset + i;
+                return (
+                  <Text key={s.id} color={actualIndex === chatPickerIndex ? inkColors.primary : undefined}>
+                    {actualIndex === chatPickerIndex ? "› " : "  "}
+                    {s.title.length > 72 ? `${s.title.slice(0, 69)}…` : s.title}
+                    <Text color={inkColors.textDisabled}>
+                      {" · "}
+                      {formatChatRelativeTime(s.updatedAt)}
+                    </Text>
+                  </Text>
+                );
+              })
+            )}
+            <Text color={inkColors.textSecondary}> ↑/↓ select  Enter confirm  Esc cancel  Type to filter </Text>
+          </Box>
+        </Box>
+        <Box flexGrow={1} />
+      </Box>
+    );
+  }
+
   if (showModelSelector) {
     const modelModalMaxHeight = 18;
     const modelModalWidth = 108;
@@ -1615,7 +1959,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
                 <Text color={inkColors.primary}> / </Text>
               </Box>
               <Box width={descWidth} flexGrow={0}>
-                <Text color={inkColors.textSecondary}> Commands. Type / then pick: /models, /compress, /brave, /help, /clear, /status, /q. Ctrl+P palette. </Text>
+                <Text color={inkColors.textSecondary}> Commands. Type / then pick: /chats, /new, /models, /rename, /delete, /compress, /brave, /help, /clear, /status, /q. Ctrl+P palette. </Text>
               </Box>
             </Box>
             <Box marginTop={1} flexDirection="row" alignItems="flex-start">
@@ -1653,6 +1997,42 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
             <Box marginTop={1}>
               <Text color={inkColors.textSecondary}> Press any key to close </Text>
             </Box>
+          </Box>
+        </Box>
+        <Box flexGrow={1} />
+      </Box>
+    );
+  }
+
+  if (showRenameChatModal) {
+    const renameModalWidth = Math.min(78, Math.max(52, termColumns - 8));
+    const topPad = Math.max(0, Math.floor((termRows - 8) / 2));
+    const leftPad = Math.max(0, Math.floor((termColumns - renameModalWidth) / 2));
+    const cur = loadChatRecord(activeChatId);
+    const renameHint =
+      cur && !cur.titleManuallySet ? firstUserTextSnippet(cur.messages) : "";
+    return (
+      <Box flexDirection="column" height={termRows} overflow="hidden">
+        <Box height={topPad} />
+        <Box flexDirection="row">
+          <Box width={leftPad} />
+          <Box
+            flexDirection="column"
+            borderStyle="single"
+            borderColor={inkColors.primary}
+            paddingX={2}
+            paddingY={1}
+            width={renameModalWidth}
+          >
+            <Text bold> Rename chat </Text>
+            {renameHint ? (
+              <Text color={inkColors.textSecondary}> From first message: {renameHint} </Text>
+            ) : null}
+            <Box flexDirection="row" marginTop={1}>
+              <Text color={inkColors.primary}> Title: </Text>
+              <Text>{renameChatInput || "\u00A0"}</Text>
+            </Box>
+            <Text color={inkColors.textSecondary}> Enter to save, Esc to cancel </Text>
           </Box>
         </Box>
         <Box flexGrow={1} />
@@ -1804,7 +2184,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
           {icons.tool} {tokenDisplay}
         </Text>
         <Text color={inkColors.footerHint}>
-          {` · ${currentModel} · / ! @  trackpad/↑/↓ scroll  Ctrl+J newline Tab queue  Esc Esc edit`}
+          {` · ${currentModel} · ${keyCreditsFooter} · / ! @ trackpad/↑/↓ scroll Ctrl+J newline Tab queue Esc Esc`}
         </Text>
       </Box>
       <Box flexDirection="column" marginTop={0}>

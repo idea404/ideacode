@@ -73,6 +73,67 @@ function isRetryableNetworkFailure(err: unknown): boolean {
   return false;
 }
 
+function parseUsdField(v: unknown): number | null {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string" && v.trim() !== "") {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+/**
+ * Remaining balance in USD for the footer: tries account credits first, then `/key` fields.
+ *
+ * - `GET /credits` returns `total_credits` and `total_usage` (remaining = credits − usage). Docs say a
+ *   [management key](https://openrouter.ai/docs/guides/overview/auth/management-api-keys) may be required;
+ *   many setups still work with the same bearer key — we try and ignore 403.
+ * - `GET /key` exposes `limit_remaining` only when a per-key **spending limit** exists; otherwise it is
+ *   often `null` even if the account has prepaid balance. We then use `limit - usage` when both are set.
+ */
+export async function fetchKeyCreditsRemaining(apiKey: string): Promise<number | null> {
+  const key = apiKey.trim();
+  if (!key) return null;
+  try {
+    const creditsRes = await fetch(config.creditsUrl, {
+      headers: { Authorization: `Bearer ${key}` },
+    });
+    if (creditsRes.ok) {
+      const creditsJson = (await creditsRes.json()) as {
+        data?: { total_credits?: unknown; total_usage?: unknown };
+      };
+      const total = parseUsdField(creditsJson.data?.total_credits);
+      const used = parseUsdField(creditsJson.data?.total_usage);
+      if (total !== null && used !== null) return Math.max(0, total - used);
+    }
+
+    const keyRes = await fetch(config.keyInfoUrl, {
+      headers: { Authorization: `Bearer ${key}` },
+    });
+    if (!keyRes.ok) return null;
+    const keyJson = (await keyRes.json()) as {
+      data?: {
+        limit_remaining?: unknown;
+        limit?: unknown;
+        usage?: unknown;
+      };
+    };
+    const d = keyJson.data;
+    if (!d) return null;
+
+    const remaining = parseUsdField(d.limit_remaining);
+    if (remaining !== null) return remaining;
+
+    const limit = parseUsdField(d.limit);
+    const usage = parseUsdField(d.usage);
+    if (limit !== null && usage !== null) return Math.max(0, limit - usage);
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export async function fetchModels(apiKey: string): Promise<OpenRouterModel[]> {
   let lastErr: Error | null = null;
   for (let attempt = 0; attempt < MODELS_FETCH_MAX_ATTEMPTS; attempt++) {
