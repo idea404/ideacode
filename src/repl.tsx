@@ -246,30 +246,18 @@ function wrapLine(line: string, width: number): string[] {
   return out.length > 0 ? out : [""];
 }
 
-const BlinkingCaret = React.memo(function BlinkingCaret({
+/** Inverse block at cursor (static — no interval re-renders; avoids idle TUI flicker). */
+const InputCaret = React.memo(function InputCaret({
   char,
-  on,
-  onColor,
-  onBold,
-  offColor,
-  offBold,
+  color,
+  bold,
 }: {
   char: string;
-  on: boolean;
-  onColor?: string;
-  onBold?: boolean;
-  offColor?: string;
-  offBold?: boolean;
+  color?: string;
+  bold?: boolean;
 }) {
-  if (on) {
-    return (
-      <Text inverse color={onColor} bold={onBold}>
-        {char}
-      </Text>
-    );
-  }
   return (
-    <Text color={offColor} bold={offBold ?? onBold}>
+    <Text inverse color={color} bold={bold}>
       {char}
     </Text>
   );
@@ -502,15 +490,6 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
   const loadingLabelRef = useRef(loadingLabel);
   const loadingFooterLinesRef = useRef(2);
   const loadingRenderRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const lastTypeTimeRef = useRef(0);
-  const [caretVisible, setCaretVisible] = useState(true);
-  useEffect(() => {
-    const t = setInterval(() => {
-      if (Date.now() - lastTypeTimeRef.current < 500) return;
-      setCaretVisible((v) => !v);
-    }, 530);
-    return () => clearInterval(t);
-  }, []);
   const [showPalette, setShowPalette] = useState(false);
   const [paletteIndex, setPaletteIndex] = useState(0);
   const [showModelSelector, setShowModelSelector] = useState(false);
@@ -657,8 +636,6 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       cursor: Math.max(0, Math.min(next.cursor, next.value.length)),
     };
     inputDraftRef.current = clamped;
-    lastTypeTimeRef.current = Date.now();
-    setCaretVisible(true);
     setInputDraft(clamped);
   }, []);
 
@@ -683,10 +660,8 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         cursor: Math.max(0, Math.min(raw.cursor, raw.value.length)),
       };
       inputDraftRef.current = next;
-      lastTypeTimeRef.current = Date.now();
       return next;
     });
-    setCaretVisible(true);
   }, []);
 
   useEffect(() => {
@@ -1829,14 +1804,14 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
           {icons.tool} {tokenDisplay}
         </Text>
         <Text color={inkColors.footerHint}>
-          {`  · ${currentModel} ·  / ! @  trackpad/↑/↓ scroll  Ctrl+J newline  multiline: Enter end=send  Tab queue  Esc Esc edit`}
+          {` · ${currentModel} · / ! @  trackpad/↑/↓ scroll  Ctrl+J newline Tab queue  Esc Esc edit`}
         </Text>
       </Box>
       <Box flexDirection="column" marginTop={0}>
         {inputDraft.value.length === 0 ? (
           <Box flexDirection="row">
             <Text color={inkColors.primary}>{icons.prompt} </Text>
-            <BlinkingCaret char={"\u00A0"} on={caretVisible} onColor={inkColors.primary} offColor={inkColors.primary} />
+            <InputCaret char={"\u00A0"} color={inkColors.primary} />
             <Text color={inkColors.textSecondary}>Message or / for commands, @ for files, ! for shell, ? for help...</Text>
           </Box>
         ) : (
@@ -1876,7 +1851,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
                       const rowNodes: React.ReactNode[] = [];
                       if (lineText === "" && v === 0 && cursorOnThisLine) {
                         rowNodes.push(
-                            <BlinkingCaret key="cursor-empty" char={"\u00A0"} on={caretVisible} onColor={inkColors.primary} offColor={inkColors.primary} />
+                            <InputCaret key="cursor-empty" char={"\u00A0"} color={inkColors.primary} />
                           );
                       } else if (cursorPosInVisual >= 0) {
                         const before = visualChunk.slice(0, cursorPosInVisual);
@@ -1890,7 +1865,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
                             : "";
                         rowNodes.push(<Text key="plain-before">{before}</Text>);
                         rowNodes.push(
-                            <BlinkingCaret key="plain-caret" char={curChar} on={caretVisible} onColor={inkColors.primary} />
+                            <InputCaret key="plain-caret" char={curChar} color={inkColors.primary} />
                           );
                         rowNodes.push(<Text key="plain-after">{after}</Text>);
                       } else {
@@ -1990,7 +1965,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
                     const lineNodes: React.ReactNode[] = [];
                     if (lineText === "" && v === 0 && cursorOnThisLine) {
                       lineNodes.push(
-                          <BlinkingCaret key="cursor" char={"\u00A0"} on={caretVisible} onColor={inkColors.primary} offColor={inkColors.primary} />
+                          <InputCaret key="cursor" char={"\u00A0"} color={inkColors.primary} />
                         );
                     } else {
                       let cursorRendered = false;
@@ -2011,14 +1986,11 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
                             const usePath = "color" in seg.style && !!seg.style.color;
                             lineNodes.push(<Text key={`${segIdx}-a`} {...seg.style}>{before}</Text>);
                             lineNodes.push(
-                              <BlinkingCaret
+                              <InputCaret
                                 key={`${segIdx}-b`}
                                 char={curChar}
-                                on={caretVisible}
-                                onColor={usePath ? inkColors.path : inkColors.primary}
-                                onBold={"bold" in seg.style && !!seg.style.bold}
-                                offColor={"color" in seg.style ? seg.style.color : undefined}
-                                offBold={"bold" in seg.style ? !!seg.style.bold : undefined}
+                                color={usePath ? inkColors.path : inkColors.primary}
+                                bold={"bold" in seg.style && !!seg.style.bold}
                               />
                             );
                             lineNodes.push(<Text key={`${segIdx}-c`} {...seg.style}>{after}</Text>);
@@ -2032,7 +2004,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
                       });
                       if (cursorPosInVisual >= 0 && !cursorRendered) {
                         lineNodes.push(
-                            <BlinkingCaret key="cursor-end" char={"\u00A0"} on={caretVisible} onColor={inkColors.primary} offColor={inkColors.primary} />
+                            <InputCaret key="cursor-end" char={"\u00A0"} color={inkColors.primary} />
                           );
                       }
                     }
