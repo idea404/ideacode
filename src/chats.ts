@@ -236,6 +236,36 @@ export function createNewChat(cwd: string): ChatRecord {
   return record;
 }
 
+/** Deep-copy messages into a new chat file and make it active (same pattern as createNewChat). */
+export function forkChat(
+  sourceMessages: ChatMessage[],
+  cwd: string,
+  opts: { customTitle?: string; sourceTitle?: string }
+): ChatRecord {
+  const id = crypto.randomUUID();
+  const messages = structuredClone(sourceMessages) as ChatMessage[];
+  let title: string;
+  if (opts.customTitle?.trim()) {
+    title = opts.customTitle.trim().slice(0, 120);
+  } else {
+    const src = (opts.sourceTitle ?? "").trim() || "Chat";
+    const piece = src.length > 70 ? `${src.slice(0, 67)}…` : src;
+    title = `Fork · ${piece}`.slice(0, 120);
+  }
+  const record: ChatRecord = {
+    v: CHAT_FORMAT_VERSION,
+    id,
+    title,
+    titleManuallySet: true,
+    updatedAt: new Date().toISOString(),
+    defaultCwd: cwd,
+    messages,
+  };
+  saveChatRecord(record);
+  saveActiveChatId(id);
+  return record;
+}
+
 export function deleteChatFile(id: string): void {
   try {
     fs.unlinkSync(chatFilePath(id));

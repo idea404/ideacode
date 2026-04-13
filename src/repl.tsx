@@ -14,6 +14,7 @@ const matchaGradient = gradient(["#7F9A65", "#5C4033"]);
 import { getModel, saveModel, saveBraveSearchApiKey, getBraveSearchApiKey, saveActiveChatId } from "./config.js";
 import {
   createNewChat,
+  forkChat,
   deleteChatFile,
   firstUserTextSnippet,
   formatChatRelativeTime,
@@ -989,6 +990,27 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         appendLog("");
         return true;
       }
+      if (canonical === "/fork") {
+        flushChatSave();
+        const parent = loadChatRecord(activeChatIdRef.current);
+        try {
+          const rec = forkChat(messagesRef.current, cwd, {
+            customTitle: slashRest.trim() || undefined,
+            sourceTitle: parent?.title,
+          });
+          applyChatRecord(rec);
+          appendLog(
+            colors.muted(
+              `  Forked into new chat “${rec.title}” (${rec.messages.length} messages). Original chat is unchanged.`
+            )
+          );
+          appendLog("");
+        } catch (err) {
+          appendLog(colors.error(`${icons.error} ${err instanceof Error ? err.message : String(err)}`));
+          appendLog("");
+        }
+        return true;
+      }
       if (canonical === "/rename") {
         const rest = slashRest.trim();
         if (rest) {
@@ -1323,6 +1345,11 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         return;
       }
       if (trimmed.startsWith("/rename")) {
+        clearInputDraft();
+        await processInput(value);
+        return;
+      }
+      if (trimmed.startsWith("/fork") || trimmed.startsWith("/duplicate")) {
         clearInputDraft();
         await processInput(value);
         return;
@@ -1959,7 +1986,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
                 <Text color={inkColors.primary}> / </Text>
               </Box>
               <Box width={descWidth} flexGrow={0}>
-                <Text color={inkColors.textSecondary}> Commands. Type / then pick: /chats, /new, /models, /rename, /delete, /compress, /brave, /help, /clear, /status, /q. Ctrl+P palette. </Text>
+                <Text color={inkColors.textSecondary}> Commands. Type / then pick: /chats, /new, /fork, /models, /rename, /delete, /compress, /brave, /help, /clear, /status, /q. Ctrl+P palette. </Text>
               </Box>
             </Box>
             <Box marginTop={1} flexDirection="row" alignItems="flex-start">

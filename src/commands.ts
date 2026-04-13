@@ -12,6 +12,11 @@ export type Command = {
 export const COMMANDS: Command[] = [
   { cmd: "/chats", desc: "Pick saved chat", aliases: ["/chat"] },
   { cmd: "/new", desc: "Start new chat", aliases: ["/new-session"] },
+  {
+    cmd: "/fork",
+    desc: "Duplicate this chat (optional: /fork title)",
+    aliases: ["/duplicate"],
+  },
   { cmd: "/rename", desc: "Rename this chat (optional: /rename title)" },
   { cmd: "/delete", desc: "Delete this chat" },
   { cmd: "/models", desc: "Switch model", aliases: ["/model"] },
