@@ -1,7 +1,12 @@
+import { Buffer } from "node:buffer";
 import { getBraveSearchApiKey } from "../config.js";
 import type { ToolArgs } from "./types.js";
 
 const MAX_FETCH_CHARS = 40_000;
+/** Cap download size before parsing (pdf-parse loads full buffer in memory). */
+const MAX_PDF_BYTES = 20 * 1024 * 1024;
+/** Cap pages rendered to keep CPU bounded on huge documents. */
+const PDF_MAX_PAGES = 120;
 const FETCH_TIMEOUT_MS = 20_000;
 const MAX_SEARCH_RESULTS = 8;
 const FETCH_CACHE_TTL_MS = 5 * 60_000;
@@ -121,13 +126,49 @@ async function fetchWithTimeout(url: string): Promise<Response> {
       signal: ac.signal,
       headers: {
         "User-Agent": "ideacode-web-fetch/2",
-        Accept: "text/html,application/json,text/plain,*/*",
+        Accept: "text/html,application/json,text/plain,application/pdf,*/*",
       },
       redirect: "follow",
     });
   } finally {
     clearTimeout(t);
   }
+}
+
+function isPdfPathname(urlStr: string): boolean {
+  try {
+    return /\.pdf(?:$|[?#])/i.test(new URL(urlStr).pathname);
+  } catch {
+    return false;
+  }
+}
+
+function looksLikePdfBuffer(buf: Buffer): boolean {
+  if (buf.length < 5) return false;
+  return buf.subarray(0, 5).toString("ascii") === "%PDF-";
+}
+
+function shouldTreatResponseAsPdfAttempt(ct: string, urlStr: string): boolean {
+  const c = ct.toLowerCase();
+  if (c.includes("application/pdf") || c.includes("application/x-pdf") || c.includes("application/acrobat")) {
+    return true;
+  }
+  if (isPdfPathname(urlStr)) return true;
+  if (c.includes("application/octet-stream") || c.includes("binary/octet-stream")) return true;
+  return false;
+}
+
+async function extractTextFromPdfBuffer(buf: Buffer): Promise<{ text: string; pageNote: string }> {
+  const pdfParse = (await import("pdf-parse")).default;
+  const result = await pdfParse(buf, { max: PDF_MAX_PAGES });
+  const raw = String(result.text ?? "")
+    .replace(/\u0000/g, "")
+    .trim();
+  let pageNote = "";
+  if (result.numpages > result.numrender) {
+    pageNote = `\n\n... (PDF has ${result.numpages} pages; extracted text from the first ${result.numrender} pages.)`;
+  }
+  return { text: raw, pageNote };
 }
 
 async function fetchWithPlaywright(url: string): Promise<string> {
@@ -185,6 +226,38 @@ export async function webFetch(args: ToolArgs): Promise<string> {
         const clipped = clipOutput(raw.trim() || "(no text content)");
         setCachedFetch(url, clipped);
         return clipped;
+      }
+
+      if (shouldTreatResponseAsPdfAttempt(ct, url)) {
+        const ab = await res.arrayBuffer();
+        const buf = Buffer.from(ab);
+        if (buf.length > MAX_PDF_BYTES) {
+          return `error: PDF too large (${buf.length} bytes; max ${MAX_PDF_BYTES} bytes)`;
+        }
+        if (!looksLikePdfBuffer(buf)) {
+          const head = buf
+            .subarray(0, Math.min(120, buf.length))
+            .toString("utf8")
+            .replace(/\s+/g, " ")
+            .trim();
+          if (isPdfPathname(url) || ct.toLowerCase().includes("pdf")) {
+            return `error: expected a PDF, but the body does not start with %PDF- (preview: ${head.slice(0, 96)}…)`;
+          }
+          return `error: binary response is not a PDF (starts with: ${head.slice(0, 96)}…)`;
+        }
+        try {
+          const { text, pageNote } = await extractTextFromPdfBuffer(buf);
+          const combined = (text || "") + pageNote;
+          if (!combined.trim()) {
+            return "error: PDF has no extractable text (may be image-only, empty, or password-protected)";
+          }
+          const clipped = clipOutput(combined.trim());
+          setCachedFetch(url, clipped);
+          return clipped;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return `error: PDF parse failed: ${msg}`;
+        }
       }
 
       if (ct.includes("text/plain") || ct.includes("text/") || ct.includes("application/xml") || ct.includes("application/xhtml")) {
