@@ -1,6 +1,6 @@
 {
   "name": "ideacode",
-  "version": "1.3.6",
+  "version": "1.4.0",
   "description": "CLI TUI for AI agents via OpenRouter — agentic loop, tools, markdown",
   "type": "module",
   "repository": {
