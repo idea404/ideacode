@@ -999,6 +999,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
             sourceTitle: parent?.title,
           });
           applyChatRecord(rec);
+          appendLog("");
           appendLog(
             colors.muted(
               `  Forked into new chat “${rec.title}” (${rec.messages.length} messages). Original chat is unchanged.`
@@ -1161,6 +1162,9 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         keepLast: 8,
         modelContextLength: modelContext,
       });
+      // Keep React `messages` in sync with what we send to the API so the footer token meter
+      // updates as soon as compression runs (otherwise it stays stale until setMessages at turn end).
+      setMessages(state);
       if (state.length < stateBeforeCompress.length) {
         appendLog(colors.muted("  (context compressed to stay under limit)\n"));
       }
