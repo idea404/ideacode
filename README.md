@@ -19,7 +19,7 @@ npm run run
 # or after build: npm run build && npm start
 ```
 
-On first run, you'll be prompted for your OpenRouter API key. Get one at [openrouter.ai/keys](https://openrouter.ai/keys). You can optionally add a Brave Search API key for web search (get one at [brave.com/search/api](https://brave.com/search/api), free tier: 2,000 queries/month). Both are saved to:
+On first run, you'll be prompted for your OpenRouter API key. Get one at [openrouter.ai/keys](https://openrouter.ai/keys). You can optionally configure **web search**: a [SearXNG](https://docs.searxng.org/) instance base URL (preferred, e.g. `http://127.0.0.1:8080`) and/or a [Brave Search API](https://brave.com/search/api) key (fallback). Settings are saved to:
 
 - **macOS/Linux:** `~/.config/ideacode/config.json`
 - **Windows:** `%LOCALAPPDATA%\ideacode\config.json`
@@ -28,15 +28,17 @@ On first run, you'll be prompted for your OpenRouter API key. Get one at [openro
 
 - `OPENROUTER_API_KEY` — API key (skips onboarding if set)
 - `MODEL` — Model ID (e.g. `anthropic/claude-sonnet-4`, `openai/gpt-4o`)
-- `BRAVE_API_KEY` or `BRAVE_SEARCH_API_KEY` — Brave Search API key (enables web_search tool)
+- `SEARXNG_URL` — SearXNG base URL (enables **web_search**; tried first). Example: `http://127.0.0.1:8080`. Your instance must allow JSON results (`format=json`). If you see **403** from a **public** instance, use a **local** Docker SearXNG and relax bot protection (e.g. in `settings.yml`: `server.limiter: false` for private use, or allow your IP).
+- `BRAVE_API_KEY` or `BRAVE_SEARCH_API_KEY` — Brave Search API key (**web_search** fallback if SearXNG fails or is unset)
 
 ## Commands
 
-- **Ctrl+P** — Open command palette (switch model, set Brave key, etc.)
+- **Ctrl+P** — Open command palette (switch model, set SearXNG URL, Brave key, etc.)
 - **Type `/`** — Inline command suggestions with descriptions (arrow keys to select, Enter to run)
 - `/` or `/palette` — Same as Ctrl+P (open command palette)
 - `/models` — Switch model (opens model selector)
-- `/brave` — Set Brave Search API key (enables web_search)
+- `/searxng` (or `/searx`) — Set SearXNG base URL (**web_search**, preferred)
+- `/brave` — Set Brave Search API key (**web_search** fallback)
 - `/c` or `/clear` — Clear conversation
 - `/q` or `exit` — Quit
 
@@ -45,7 +47,7 @@ On first run, you'll be prompted for your OpenRouter API key. Get one at [openro
 `read`, `write`, `edit`, `glob`, `grep`, `bash`. Plus:
 
 - **web_fetch** — Fetch a URL and return main text. Tries plain `fetch()` first (works for raw GitHub, static HTML, APIs); falls back to Playwright for JS-rendered pages.
-- **web_search** — Search the web via [Brave Search API](https://brave.com/search/api). Only available when a Brave API key is set (onboarding or `/brave`). Without a key, the agent is not offered this tool.
+- **web_search** — Search the web. Uses your [SearXNG](https://docs.searxng.org/) instance first (`SEARXNG_URL` or `/searxng`), then [Brave Search API](https://brave.com/search/api) if configured. The agent only sees this tool when at least one backend is set.
 
 **web_fetch** uses Chromium for JS-rendered pages; it is installed automatically via postinstall. If you see "Executable doesn't exist", run `npx playwright install chromium` in the project directory.
 

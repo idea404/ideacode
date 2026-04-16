@@ -17,6 +17,8 @@ export type StoredConfig = {
   apiKey?: string;
   model?: string;
   braveSearchApiKey?: string;
+  /** Base URL of a SearXNG instance (e.g. http://127.0.0.1:8080). Env SEARXNG_URL overrides when set. */
+  searxngUrl?: string;
   /** Persisted active chat id (conversations/chats/<id>.json). */
   activeChatId?: string;
 };
@@ -60,6 +62,33 @@ export function saveBraveSearchApiKey(key: string): void {
   const config = loadConfigFile();
   config.braveSearchApiKey = key || undefined;
   saveConfigFile(config);
+}
+
+/** File-only value (for UI); effective URL may come from SEARXNG_URL. */
+export function getStoredSearxngUrl(): string | undefined {
+  return loadConfigFile().searxngUrl?.trim();
+}
+
+/**
+ * SearXNG instance base URL (no trailing slash). SEARXNG_URL env wins over config file.
+ */
+export function getSearxngUrl(): string | undefined {
+  const fromEnv = process.env.SEARXNG_URL?.trim();
+  if (fromEnv) return fromEnv.replace(/\/$/, "");
+  const fromFile = loadConfigFile().searxngUrl?.trim();
+  return fromFile ? fromFile.replace(/\/$/, "") : undefined;
+}
+
+export function saveSearxngUrl(url: string): void {
+  const config = loadConfigFile();
+  const t = url.trim();
+  config.searxngUrl = t ? t.replace(/\/$/, "") : undefined;
+  saveConfigFile(config);
+}
+
+/** True when web_search can run (SearXNG and/or Brave is configured). */
+export function isWebSearchConfigured(): boolean {
+  return !!(getSearxngUrl() || getBraveSearchApiKey());
 }
 
 export function saveApiKey(apiKey: string): void {

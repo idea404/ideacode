@@ -1,10 +1,10 @@
 /**
- * Test module for web_search (Brave Search API only).
- * Requires BRAVE_API_KEY or BRAVE_SEARCH_API_KEY in env or .env (free tier: https://brave.com/search/api).
+ * Test module for web_search (SearXNG preferred, else Brave Search API).
+ * Set SEARXNG_URL and/or BRAVE_API_KEY (or BRAVE_SEARCH_API_KEY) in env or .env.
  * Run: npm run test:web-search
  */
 import "dotenv/config";
-import { getBraveSearchApiKey } from "../config.js";
+import { isWebSearchConfigured } from "../config.js";
 import { webSearch } from "./web.js";
 
 const TESTS = [
@@ -70,12 +70,14 @@ async function runRapidTwo(): Promise<{ ok: boolean; message: string }> {
 }
 
 async function main(): Promise<void> {
-  if (!getBraveSearchApiKey()) {
-    console.log("web_search tests require BRAVE_API_KEY or BRAVE_SEARCH_API_KEY (free tier: https://brave.com/search/api).");
+  if (!isWebSearchConfigured()) {
+    console.log(
+      "web_search tests require SEARXNG_URL and/or BRAVE_API_KEY (or BRAVE_SEARCH_API_KEY). See README."
+    );
     process.exit(1);
   }
 
-  console.log("web_search tests (Brave Search API)\n");
+  console.log("web_search tests (SearXNG and/or Brave)\n");
 
   let failed = 0;
   for (const t of TESTS) {

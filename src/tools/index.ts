@@ -1,4 +1,4 @@
-import { getBraveSearchApiKey } from "../config.js";
+import { isWebSearchConfigured } from "../config.js";
 import { readFile, writeFile, editFile } from "./file.js";
 import { globFiles, grepFiles } from "./search.js";
 import { runBash, runBashDetach, runBashLogs, runBashStatus } from "./bash.js";
@@ -53,15 +53,14 @@ export const TOOLS: Record<string, ToolDef> = {
     webFetch,
   ],
   web_search: [
-    "Search the web and return ranked results (title, url, snippet). Use for current info, docs, GitHub repos.",
+    "Search the web and return ranked results (title, url, snippet). Prefers SearXNG (SEARXNG_URL / /searxng), then Brave if configured. Use for current info, docs, GitHub repos.",
     { query: "string" },
     webSearch,
   ],
 };
 
 function getTools(): Record<string, ToolDef> {
-  const braveKey = getBraveSearchApiKey();
-  if (braveKey) return TOOLS;
+  if (isWebSearchConfigured()) return TOOLS;
   const { web_search: _, ...rest } = TOOLS;
   return rest;
 }
@@ -72,8 +71,8 @@ function normalizeToolName(name: string): string {
 
 export async function runTool(name: string, args: ToolArgs): Promise<string> {
   const canonical = normalizeToolName(name);
-  if (canonical === "web_search" && !getBraveSearchApiKey()) {
-    return "error: Brave Search API key not set. Use /brave or set BRAVE_API_KEY to enable web search.";
+  if (canonical === "web_search" && !isWebSearchConfigured()) {
+    return "error: Web search not configured. Set SEARXNG_URL or /searxng, or BRAVE_API_KEY / /brave.";
   }
   const tools = getTools();
   const def = tools[canonical];

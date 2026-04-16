@@ -11,7 +11,16 @@ import gradient from "gradient-string";
 
 // Custom matcha-themed gradient: matcha green → dark sepia
 const matchaGradient = gradient(["#7F9A65", "#5C4033"]);
-import { getModel, saveModel, saveBraveSearchApiKey, getBraveSearchApiKey, saveActiveChatId } from "./config.js";
+import {
+  getModel,
+  saveModel,
+  saveBraveSearchApiKey,
+  getBraveSearchApiKey,
+  saveSearxngUrl,
+  getStoredSearxngUrl,
+  getSearxngUrl,
+  saveActiveChatId,
+} from "./config.js";
 import {
   createNewChat,
   forkChat,
@@ -518,6 +527,8 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
   const [modelSearchFilter, setModelSearchFilter] = useState("");
   const [showBraveKeyModal, setShowBraveKeyModal] = useState(false);
   const [braveKeyInput, setBraveKeyInput] = useState("");
+  const [showSearxngModal, setShowSearxngModal] = useState(false);
+  const [searxngInput, setSearxngInput] = useState("");
   const [showHelpModal, setShowHelpModal] = useState(false);
   const [slashSuggestionIndex, setSlashSuggestionIndex] = useState(0);
   const inputDraftRef = useRef(inputDraft);
@@ -896,14 +907,22 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
     });
   }, [appendLog]);
 
-  const braveKeyHadExistingRef = useRef(false);
-  const BRAVE_KEY_PLACEHOLDER = "••••••••";
+  /** Trimmed key shown when modal opened (env or file); used to detect real changes on Enter. */
+  const braveKeyInitialRef = useRef("");
+  /** True after user edits the Brave key field. */
+  const braveKeyDirtyRef = useRef(false);
 
   const openBraveKeyModal = useCallback(() => {
-    const existing = getBraveSearchApiKey();
-    braveKeyHadExistingRef.current = !!existing;
-    setBraveKeyInput(existing ? BRAVE_KEY_PLACEHOLDER : "");
+    const initial = getBraveSearchApiKey()?.trim() ?? "";
+    braveKeyInitialRef.current = initial;
+    braveKeyDirtyRef.current = false;
+    setBraveKeyInput(initial);
     setShowBraveKeyModal(true);
+  }, []);
+
+  const openSearxngModal = useCallback(() => {
+    setSearxngInput(getStoredSearxngUrl() ?? "");
+    setShowSearxngModal(true);
   }, []);
 
   const openHelpModal = useCallback(() => setShowHelpModal(true), []);
@@ -1053,6 +1072,10 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         appendLog("");
         return true;
       }
+      if (canonical === "/searxng") {
+        openSearxngModal();
+        return true;
+      }
       if (canonical === "/brave") {
         openBraveKeyModal();
         return true;
@@ -1065,6 +1088,17 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         const rec = loadChatRecord(activeChatIdRef.current);
         const title = rec?.title ?? "(unknown)";
         const shortId = activeChatIdRef.current.slice(0, 8);
+        const searxEff = getSearxngUrl();
+        const searchBits: string[] = [];
+        if (searxEff) {
+          const u = searxEff.length > 56 ? `${searxEff.slice(0, 56)}…` : searxEff;
+          searchBits.push(`SearXNG (${u})`);
+        }
+        if (getBraveSearchApiKey()) searchBits.push("Brave fallback");
+        const searchLine =
+          searchBits.length > 0
+            ? colors.muted(`  web_search: ${searchBits.join(" · ")}`)
+            : colors.muted("  web_search: (not configured — /searxng or /brave)");
         appendLog(
           colors.muted(`  Chat: ${title}`) +
             colors.dim(` · ${shortId}…`) +
@@ -1074,6 +1108,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
             colors.accent(cwd) +
             colors.dim(` · ${messages.length} messages`)
         );
+        appendLog(searchLine);
         appendLog("");
         return true;
       }
@@ -1320,6 +1355,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       openModelSelector,
       openChatSelector,
       openBraveKeyModal,
+      openSearxngModal,
       openHelpModal,
       flushChatSave,
       applyChatRecord,
@@ -1363,6 +1399,11 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         await processInput(trimmed);
         return;
       }
+      if (trimmed === "/searxng" || trimmed === "/searx") {
+        clearInputDraft();
+        openSearxngModal();
+        return;
+      }
       if (trimmed === "/brave") {
         clearInputDraft();
         openBraveKeyModal();
@@ -1398,6 +1439,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       openModelSelector,
       openChatSelector,
       openBraveKeyModal,
+      openSearxngModal,
       openHelpModal,
       clearInputDraft,
     ]
@@ -1449,24 +1491,76 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       }
       return;
     }
+    if (showSearxngModal) {
+      if (key.return) {
+        const toSave = searxngInput.trim().slice(0, 512);
+        saveSearxngUrl(toSave);
+        setShowSearxngModal(false);
+        setSearxngInput("");
+        const envOverride = Boolean(process.env.SEARXNG_URL?.trim());
+        if (toSave) {
+          appendLog(
+            envOverride
+              ? colors.success("SearXNG URL saved to config. SEARXNG_URL in environment still takes priority.")
+              : colors.success("SearXNG URL saved. web_search will use this instance first.")
+          );
+        } else {
+          appendLog(
+            envOverride
+              ? colors.muted("Cleared saved SearXNG URL. SEARXNG_URL env is still set.")
+              : colors.muted("Cleared saved SearXNG URL.")
+          );
+        }
+        appendLog("");
+      } else if (key.escape) {
+        setShowSearxngModal(false);
+        setSearxngInput("");
+      } else if (key.backspace || key.delete) {
+        setSearxngInput((prev) => prev.slice(0, -1));
+      } else if (input && !key.ctrl && !key.meta && input !== "\b" && input !== "\x7f") {
+        setSearxngInput((prev) => (prev + input).slice(0, 512));
+      }
+      return;
+    }
     if (showBraveKeyModal) {
       if (key.return) {
-        const isPlaceholder = braveKeyInput === BRAVE_KEY_PLACEHOLDER;
-        const isEmpty = !braveKeyInput.trim();
-        const unchanged = isPlaceholder || (braveKeyHadExistingRef.current && isEmpty);
-        const keyToSave = unchanged ? "" : braveKeyInput.trim();
-        if (keyToSave) saveBraveSearchApiKey(keyToSave);
+        const trimmed = braveKeyInput.trim();
+        const unchanged = !braveKeyDirtyRef.current && trimmed === braveKeyInitialRef.current;
         setShowBraveKeyModal(false);
         setBraveKeyInput("");
-        appendLog(keyToSave ? colors.success("Brave Search API key saved. web_search is now available.") : colors.muted("Brave key unchanged."));
+        if (unchanged) {
+          appendLog(colors.muted("Brave key unchanged."));
+        } else {
+          saveBraveSearchApiKey(trimmed);
+          const envOverride = Boolean(
+            process.env.BRAVE_API_KEY?.trim() || process.env.BRAVE_SEARCH_API_KEY?.trim()
+          );
+          if (trimmed) {
+            appendLog(
+              colors.success(
+                "Brave Search API key saved. Used as web_search fallback after SearXNG (if configured)."
+              )
+            );
+          } else {
+            appendLog(
+              envOverride
+                ? colors.muted(
+                    "Brave key removed from config. BRAVE_API_KEY / BRAVE_SEARCH_API_KEY in environment still applies."
+                  )
+                : colors.success("Brave Search API key removed from config.")
+            );
+          }
+        }
         appendLog("");
       } else if (key.escape) {
         setShowBraveKeyModal(false);
         setBraveKeyInput("");
       } else if (key.backspace || key.delete) {
-        setBraveKeyInput((prev) => (prev === BRAVE_KEY_PLACEHOLDER ? "" : prev.slice(0, -1)));
+        braveKeyDirtyRef.current = true;
+        setBraveKeyInput((prev) => prev.slice(0, -1));
       } else if (input && !key.ctrl && !key.meta && input !== "\b" && input !== "\x7f") {
-        setBraveKeyInput((prev) => (prev === BRAVE_KEY_PLACEHOLDER ? input : prev + input));
+        braveKeyDirtyRef.current = true;
+        setBraveKeyInput((prev) => (prev + input).slice(0, 512));
       }
       return;
     }
@@ -1569,6 +1663,10 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
           }
           if (selected.cmd === "/chats") {
             openChatSelector();
+            return;
+          }
+          if (selected.cmd === "/searxng") {
+            openSearxngModal();
             return;
           }
           if (selected.cmd === "/brave") {
@@ -1990,7 +2088,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
                 <Text color={inkColors.primary}> / </Text>
               </Box>
               <Box width={descWidth} flexGrow={0}>
-                <Text color={inkColors.textSecondary}> Commands. Type / then pick: /chats, /new, /fork, /models, /rename, /delete, /compress, /brave, /help, /clear, /status, /q. Ctrl+P palette. </Text>
+                <Text color={inkColors.textSecondary}> Commands. Type / then pick: /chats, /new, /fork, /models, /rename, /delete, /compress, /searxng, /brave, /help, /clear, /status, /q. Ctrl+P palette. </Text>
               </Box>
             </Box>
             <Box marginTop={1} flexDirection="row" alignItems="flex-start">
@@ -2071,6 +2169,44 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
     );
   }
 
+  if (showSearxngModal) {
+    const searxModalWidth = Math.min(72, Math.max(52, termColumns - 8));
+    const topPad = Math.max(0, Math.floor((termRows - 8) / 2));
+    const leftPad = Math.max(0, Math.floor((termColumns - searxModalWidth) / 2));
+    const envSet = Boolean(process.env.SEARXNG_URL?.trim());
+    return (
+      <Box flexDirection="column" height={termRows} overflow="hidden">
+        <Box height={topPad} />
+        <Box flexDirection="row">
+          <Box width={leftPad} />
+          <Box
+            flexDirection="column"
+            borderStyle="single"
+            borderColor={inkColors.primary}
+            paddingX={2}
+            paddingY={1}
+            width={searxModalWidth}
+          >
+            <Text bold> SearXNG base URL </Text>
+            <Text color={inkColors.textSecondary}>
+              {" "}
+              Example: http://127.0.0.1:8080 — web_search tries SearXNG first, then Brave if configured.
+            </Text>
+            {envSet ? (
+              <Text color={inkColors.textSecondary}> SEARXNG_URL is set in the environment (overrides saved URL). </Text>
+            ) : null}
+            <Box flexDirection="row" marginTop={1}>
+              <Text color={inkColors.primary}> URL: </Text>
+              <Text>{searxngInput || "\u00A0"}</Text>
+            </Box>
+            <Text color={inkColors.textSecondary}> Enter to save (empty clears saved URL), Esc to cancel </Text>
+          </Box>
+        </Box>
+        <Box flexGrow={1} />
+      </Box>
+    );
+  }
+
   if (showBraveKeyModal) {
     const braveModalWidth = 52;
     const topPad = Math.max(0, Math.floor((termRows - 6) / 2));
@@ -2090,9 +2226,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
           >
             <Text bold> Brave Search API key </Text>
             <Text color={inkColors.textSecondary}> Get one at https://brave.com/search/api </Text>
-            {braveKeyInput === BRAVE_KEY_PLACEHOLDER && (
-              <Text color={inkColors.textSecondary}> Key already set. Type or paste to replace. </Text>
-            )}
+            <Text color={inkColors.textSecondary}> Edit or clear and Enter to remove from config. </Text>
             <Box flexDirection="row" marginTop={1}>
               <Text color={inkColors.primary}> Key: </Text>
               <Text>{braveKeyInput || "\u00A0"}</Text>

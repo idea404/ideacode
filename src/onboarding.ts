@@ -1,7 +1,7 @@
 import * as readline from "node:readline";
 import ora from "ora";
 import { fetchModels } from "./api.js";
-import { saveApiKey, saveModel, saveBraveSearchApiKey } from "./config.js";
+import { saveApiKey, saveModel, saveBraveSearchApiKey, saveSearxngUrl } from "./config.js";
 import { colors } from "./ui/index.js";
 
 function question(prompt: string): Promise<string> {
@@ -61,7 +61,17 @@ export async function runOnboarding(): Promise<{ apiKey: string; model: string }
       saveModel(model);
 
       console.log(
-        colors.muted("  Brave Search API key (optional, for web search). Get one at https://brave.com/search/api")
+        colors.muted(
+          "  SearXNG base URL (optional, preferred for web search). Example: http://127.0.0.1:8080 — docs: https://docs.searxng.org"
+        )
+      );
+      const searxUrl = await question(colors.muted("  SearXNG URL (Enter to skip): "));
+      if (searxUrl.trim()) saveSearxngUrl(searxUrl.trim());
+
+      console.log(
+        colors.muted(
+          "  Brave Search API key (optional web search fallback). Get one at https://brave.com/search/api"
+        )
       );
       const braveKey = await question(colors.muted("  Brave key (Enter to skip): "));
       if (braveKey.trim()) saveBraveSearchApiKey(braveKey.trim());
