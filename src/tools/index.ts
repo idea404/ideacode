@@ -7,7 +7,7 @@ import type { ToolArgs, ToolDef } from "./types.js";
 
 export const TOOLS: Record<string, ToolDef> = {
   read: [
-    "Read a portion of a file with line numbers (file path, not directory). Prefer offset and limit for anything beyond a small file; do not read entire large files in one call. Long output is truncated; use offset/limit to get more.",
+    "Primary use: read a local file from disk. The path argument must be a filesystem path to a file (not a directory). Returns numbered lines; use offset and limit for large files. For web pages, prefer web_fetch with the URL; http(s) paths are accepted as a shortcut (same as web_fetch). Long output is truncated.",
     { path: "string", offset: "number?", limit: "number?" },
     readFile,
   ],

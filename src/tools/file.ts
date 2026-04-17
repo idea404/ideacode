@@ -1,10 +1,17 @@
 import * as fs from "node:fs";
 import type { ToolArgs } from "./types.js";
+import { webFetch } from "./web.js";
 
 const DEFAULT_READ_LIMIT = 500;
 
-export function readFile(args: ToolArgs): string {
-  const content = fs.readFileSync(args.path as string, "utf-8");
+export async function readFile(args: ToolArgs): Promise<string> {
+  const rawPath = String(args.path ?? "").trim();
+  if (!rawPath) return "error: path is required";
+  if (rawPath.startsWith("http://") || rawPath.startsWith("https://")) {
+    return webFetch({ url: rawPath });
+  }
+
+  const content = fs.readFileSync(rawPath, "utf-8");
   const parts = content.split("\n");
   const lines = content.endsWith("\n") ? parts.slice(0, -1) : parts;
   if (lines.length === 0 && content === "") return "";
