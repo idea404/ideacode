@@ -1,4 +1,4 @@
-import { callSummarize } from "./api.js";
+import { callSummarize, type SummarizeRoute } from "./api.js";
 
 export type Message = { role: string; content: unknown };
 const MAX_PINNED_FACTS = 28;
@@ -152,10 +152,10 @@ export function estimateTokensForString(str: string): number {
 }
 
 export async function compressState(
-  apiKey: string,
+  summarizeRoute: SummarizeRoute,
+  requestModel: string,
   state: Message[],
   systemPrompt: string,
-  model: string,
   options: { keepLast: number; modelContextLength?: number }
 ): Promise<Message[]> {
   const { keepLast, modelContextLength } = options;
@@ -164,7 +164,7 @@ export async function compressState(
   const recent = takeRecentSlice(cleaned, keepLast);
   const toSummarize = cleaned.slice(0, cleaned.length - recent.length);
   if (toSummarize.length === 0) return cleaned;
-  const summary = await callSummarize(apiKey, toSummarize, model, {
+  const summary = await callSummarize(summarizeRoute, requestModel, toSummarize, {
     contextLengthTokens: modelContextLength,
   });
   const pinnedFacts = extractPinnedFacts(toSummarize);
@@ -176,17 +176,17 @@ export async function compressState(
 }
 
 export async function ensureUnderBudget(
-  apiKey: string,
+  summarizeRoute: SummarizeRoute,
+  requestModel: string,
   state: Message[],
   systemPrompt: string,
-  model: string,
   options: { maxTokens: number; keepLast: number; modelContextLength?: number }
 ): Promise<Message[]> {
   const { maxTokens, keepLast, modelContextLength } = options;
   let working = sanitizeMessagesForApi(state);
   if (estimateTokens(working, systemPrompt) <= maxTokens) return working;
   if (working.length > keepLast) {
-    working = await compressState(apiKey, working, systemPrompt, model, {
+    working = await compressState(summarizeRoute, requestModel, working, systemPrompt, {
       keepLast,
       modelContextLength,
     });
@@ -228,10 +228,10 @@ export type CompressToBudgetResult = {
  * pinned facts) until estimated tokens ≤ targetMaxTokens, tightening keep-recent if needed.
  */
 export async function compressConversationToTargetBudget(
-  apiKey: string,
+  summarizeRoute: SummarizeRoute,
+  requestModel: string,
   state: Message[],
   systemPrompt: string,
-  model: string,
   options: {
     targetMaxTokens: number;
     keepLastInitial?: number;
@@ -269,7 +269,7 @@ export async function compressConversationToTargetBudget(
       }
       break;
     }
-    working = await compressState(apiKey, working, systemPrompt, model, {
+    working = await compressState(summarizeRoute, requestModel, working, systemPrompt, {
       keepLast,
       modelContextLength,
     });

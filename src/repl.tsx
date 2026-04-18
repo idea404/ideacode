@@ -20,6 +20,10 @@ import {
   getStoredSearxngUrl,
   getSearxngUrl,
   saveActiveChatId,
+  getOpenAiCompatProviders,
+  upsertOpenAiCompatProvider,
+  removeOpenAiCompatProvider,
+  type OpenAiCompatProvider,
 } from "./config.js";
 import {
   createNewChat,
@@ -36,7 +40,17 @@ import {
   type ChatSummary,
 } from "./chats.js";
 import type { ContentBlock, OpenRouterModel } from "./api.js";
-import { callApi, fetchKeyCreditsRemaining, fetchModels } from "./api.js";
+import {
+  callApi,
+  fetchAllModels,
+  fetchKeyCreditsRemaining,
+  maybeMigrateOaicModelId,
+  normalizeOpenAiBaseUrl,
+  parseOaicModelId,
+  resolveOaicProvider,
+  type CallApiRoute,
+  type SummarizeRoute,
+} from "./api.js";
 import { getVersion, checkForUpdate } from "./version.js";
 import {
   estimateTokens,
@@ -92,6 +106,33 @@ const PARALLEL_SAFE_TOOLS = new Set([
 const LOADING_TICK_MS = 80;
 const MAX_EMPTY_ASSISTANT_RETRIES = 3;
 const TYPING_LAYOUT_FREEZE_MS = 120;
+
+function resolveLlmTargets(
+  apiKey: string,
+  currentModel: string,
+  providers: OpenAiCompatProvider[]
+): { callRoute: CallApiRoute; summarizeRoute: SummarizeRoute; requestModel: string } {
+  const oaic = parseOaicModelId(currentModel);
+  if (oaic) {
+    const p = resolveOaicProvider(providers, oaic.providerKey);
+    if (!p) {
+      throw new Error(
+        "This model uses a custom provider that is no longer configured. Use /models to pick another model or /new-provider to add the endpoint again."
+      );
+    }
+    const baseUrl = normalizeOpenAiBaseUrl(p.baseUrl);
+    return {
+      callRoute: { kind: "oaic", baseUrl, apiKey: p.apiKey },
+      summarizeRoute: { kind: "oaic", baseUrl, apiKey: p.apiKey },
+      requestModel: oaic.openAiModelId,
+    };
+  }
+  return {
+    callRoute: { kind: "openrouter", apiKey },
+    summarizeRoute: { kind: "openrouter", apiKey },
+    requestModel: currentModel,
+  };
+}
 
 type InputDraft = { value: string; cursor: number };
 const SLASH_SUGGESTION_ROWS = Math.max(1, COMMANDS.length);
@@ -359,9 +400,53 @@ function buildAgentSystemPrompt(cwd: string): string {
     `Web: Prefer web_fetch for HTTP(S) URLs. read is for local disk paths; http(s) in read is a shortcut (same as web_fetch). If web_fetch or read returns an error: line or obviously thin content, change tactic once—e.g. web_search for another URL or a print/mobile variant—not the same failing call repeated.`,
     `Tools vs shell: Prefer grep, read, write, edit over bash when they fit the job (avoid !cat / !rg when those tools apply). Bash: no decorative echo headers; direct commands. Long-running work: bash_detach, then bash_status and bash_logs.`,
     `Parallelism: Use many parallel independent tool calls in one turn when useful (often >3 for broad research), but keep each call high-signal, non-redundant, and small in output.`,
+    `Anti-loop: Before calling a tool, check recent turns. If you already used the same tool with the same arguments and the result was thin or duplicate, do not repeat—synthesize from what you have, try a materially different query or URL, or say what cannot be verified.`,
     `Unless the user clearly wants only a plan or discussion with no investigation, use tools to answer; do not replace missing evidence with a long speculative essay.`,
     `Keep assistant text brief (at most a sentence or two before tool rounds when needed).`,
   ].join("\n\n");
+}
+
+const IDENTICAL_ASSISTANT_TOOL_ROUNDS = 3;
+
+/** Stable fingerprint of all tool_use blocks in one assistant message (order-independent for parallel batches). */
+function assistantToolRoundSignature(m: { role: string; content: unknown }): string | null {
+  if (m.role !== "assistant") return null;
+  const c = m.content;
+  if (!Array.isArray(c)) return null;
+  const uses = c.filter(
+    (b) => b && typeof b === "object" && (b as { type?: string }).type === "tool_use"
+  ) as Array<{ name?: string; input?: Record<string, unknown> }>;
+  if (uses.length === 0) return null;
+  const parts = uses.map((u) => {
+    const name = (u.name ?? "").trim().toLowerCase();
+    const input = u.input ?? {};
+    const keys = Object.keys(input).sort();
+    const norm: Record<string, unknown> = {};
+    for (const k of keys) norm[k] = input[k]!;
+    return `${name}\0${JSON.stringify(norm)}`;
+  });
+  parts.sort();
+  return parts.join("|");
+}
+
+/**
+ * If the last N assistant tool rounds are identical, return a one-shot system nudge (perseveration on e.g. web_search).
+ */
+function identicalToolLoopNudge(
+  state: Array<{ role: string; content: unknown }>
+): string | undefined {
+  const sigs: string[] = [];
+  for (let i = state.length - 1; i >= 0 && sigs.length < IDENTICAL_ASSISTANT_TOOL_ROUNDS; i--) {
+    if (state[i]!.role !== "assistant") continue;
+    const sig = assistantToolRoundSignature(state[i]!);
+    if (sig) sigs.push(sig);
+  }
+  if (sigs.length < IDENTICAL_ASSISTANT_TOOL_ROUNDS) return undefined;
+  const [a, b, c] = sigs;
+  if (a === b && b === c) {
+    return `URGENT — The last ${IDENTICAL_ASSISTANT_TOOL_ROUNDS} assistant tool rounds used the exact same tool call(s). Do not repeat them. Stop searching with the same query. Either answer using evidence already in this conversation or change strategy (different keywords, web_fetch a specific URL, or explain what cannot be verified).`;
+  }
+  return undefined;
 }
 
 function useTerminalSize(): { rows: number; columns: number } {
@@ -537,6 +622,14 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
   const [braveKeyInput, setBraveKeyInput] = useState("");
   const [showSearxngModal, setShowSearxngModal] = useState(false);
   const [searxngInput, setSearxngInput] = useState("");
+  const [oaicProviders, setOaicProviders] = useState<OpenAiCompatProvider[]>(getOpenAiCompatProviders);
+  const [showProviderWizardModal, setShowProviderWizardModal] = useState(false);
+  const [providerWizardStep, setProviderWizardStep] = useState(0);
+  const [providerWizardUrl, setProviderWizardUrl] = useState("");
+  const [providerWizardName, setProviderWizardName] = useState("");
+  const [providerWizardKey, setProviderWizardKey] = useState("");
+  const [showProviderRemoveModal, setShowProviderRemoveModal] = useState(false);
+  const [providerRemoveIndex, setProviderRemoveIndex] = useState(0);
   const [showHelpModal, setShowHelpModal] = useState(false);
   const [slashSuggestionIndex, setSlashSuggestionIndex] = useState(0);
   const inputDraftRef = useRef(inputDraft);
@@ -659,6 +752,11 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
     return ctx != null ? Math.round(ctx / 1024) : CONTEXT_WINDOW_K;
   }, [modelList, currentModel]);
   const tokenDisplay = `${Math.round(estimatedTokens / 1000)}K / ${contextWindowK}K`;
+  /** OpenRouter balance is N/A for local OpenAI-compatible endpoints. */
+  const balanceFooterDisplay = useMemo(
+    () => (parseOaicModelId(currentModel) ? "\u221E" : keyCreditsFooter),
+    [currentModel, keyCreditsFooter]
+  );
 
   const filteredModelList = useMemo(() => {
     const q = modelSearchFilter.trim().toLowerCase();
@@ -776,8 +874,14 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
   }, []);
 
   useEffect(() => {
-    if (apiKey) fetchModels(apiKey).then(setModelList);
-  }, [apiKey]);
+    void (async () => {
+      try {
+        setModelList(await fetchAllModels(apiKey, oaicProviders));
+      } catch {
+        setModelList([]);
+      }
+    })();
+  }, [apiKey, oaicProviders]);
 
   const refreshKeyCredits = useCallback(async () => {
     if (!apiKey.trim()) {
@@ -829,6 +933,21 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       setChatPickerIndex(0);
     }
   }, [showChatSelector]);
+
+  useEffect(() => {
+    if (showProviderRemoveModal && oaicProviders.length > 0) {
+      setProviderRemoveIndex((i) => Math.min(i, oaicProviders.length - 1));
+    }
+  }, [showProviderRemoveModal, oaicProviders.length]);
+
+  useEffect(() => {
+    const m = getModel();
+    const next = maybeMigrateOaicModelId(m, oaicProviders);
+    if (next !== m) {
+      saveModel(next);
+      setCurrentModel(next);
+    }
+  }, [oaicProviders]);
 
   useEffect(() => {
     if (showChatSelector && filteredChatList.length > 0) {
@@ -937,11 +1056,30 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
 
   const openModelSelector = useCallback(async () => {
     setShowPalette(false);
-    const models = await fetchModels(apiKey);
-    setModelList(models);
+    try {
+      setModelList(await fetchAllModels(apiKey, oaicProviders));
+    } catch {
+      // keep existing list
+    }
     setModelIndex(0);
     setShowModelSelector(true);
-  }, [apiKey]);
+  }, [apiKey, oaicProviders]);
+
+  const openProviderWizard = useCallback(() => {
+    setShowPalette(false);
+    setProviderWizardStep(0);
+    setProviderWizardUrl("");
+    setProviderWizardName("");
+    setProviderWizardKey("");
+    setShowProviderWizardModal(true);
+  }, []);
+
+  const openProviderRemoveModalFn = useCallback(() => {
+    setShowPalette(false);
+    if (getOpenAiCompatProviders().length === 0) return;
+    setProviderRemoveIndex(0);
+    setShowProviderRemoveModal(true);
+  }, []);
 
   const openChatSelector = useCallback(() => {
     setShowPalette(false);
@@ -1004,6 +1142,44 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       }
       if (canonical === "/models") {
         await openModelSelector();
+        return true;
+      }
+      if (canonical === "/providers") {
+        const list = getOpenAiCompatProviders();
+        if (list.length === 0) {
+          appendLog(
+            colors.muted(
+              "  No custom OpenAI-compatible providers. Use /new-provider to add one (expects GET/POST …/v1/models and …/v1/chat/completions)."
+            )
+          );
+        } else {
+          appendLog(colors.muted("  OpenAI-compatible providers:"));
+          for (const p of list) {
+            appendLog(
+              colors.muted(`    · ${p.name}`) +
+                colors.dim(`  oaic:${p.slug}/<model>  ·  ${p.baseUrl}`)
+            );
+          }
+        }
+        appendLog("");
+        return true;
+      }
+      if (
+        canonical === "/new-provider" ||
+        canonical === "/add-provider" ||
+        canonical === "/openai-provider"
+      ) {
+        openProviderWizard();
+        return true;
+      }
+      if (canonical === "/remove-provider") {
+        const list = getOpenAiCompatProviders();
+        if (list.length === 0) {
+          appendLog(colors.muted("  No custom providers. Use /new-provider to add one."));
+          appendLog("");
+          return true;
+        }
+        openProviderRemoveModalFn();
         return true;
       }
       if (canonical === "/chats") {
@@ -1116,6 +1292,14 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
             colors.accent(cwd) +
             colors.dim(` · ${messages.length} messages`)
         );
+        const oaicCount = getOpenAiCompatProviders().length;
+        appendLog(
+          oaicCount > 0
+            ? colors.muted(
+                `  LLM: OpenRouter + ${oaicCount} custom OpenAI-compatible endpoint(s) (/providers · /new-provider)`
+              )
+            : colors.muted("  LLM: OpenRouter (/new-provider to add OpenAI-compatible endpoints)")
+        );
         appendLog(searchLine);
         appendLog("");
         return true;
@@ -1129,7 +1313,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         let models = modelList;
         if (models.length === 0) {
           try {
-            models = await fetchModels(apiKey);
+            models = await fetchAllModels(apiKey, oaicProviders);
             setModelList(models);
           } catch (err) {
             appendLog(
@@ -1143,13 +1327,28 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         const ctxLen = models.find((m) => m.id === currentModel)?.context_length;
         const targetMaxTokens = manualCompressTargetMaxTokens(ctxLen);
         const systemPrompt = buildAgentSystemPrompt(cwd);
+        let summarizeRoute: SummarizeRoute;
+        let requestModel: string;
+        try {
+          ({ summarizeRoute, requestModel } = resolveLlmTargets(apiKey, currentModel, oaicProviders));
+        } catch (err) {
+          appendLog(colors.error(`${icons.error} ${err instanceof Error ? err.message : String(err)}`));
+          appendLog("");
+          return true;
+        }
         setLoadingLabel("Compressing context…");
         setLoading(true);
         try {
-          const result = await compressConversationToTargetBudget(apiKey, messages, systemPrompt, currentModel, {
-            targetMaxTokens,
-            modelContextLength: ctxLen,
-          });
+          const result = await compressConversationToTargetBudget(
+            summarizeRoute,
+            requestModel,
+            messages,
+            systemPrompt,
+            {
+              targetMaxTokens,
+              modelContextLength: ctxLen,
+            }
+          );
           setMessages(result.messages);
           const kb = (n: number) => `${Math.round(n / 1000)}K`;
           if (!result.changed) {
@@ -1195,12 +1394,22 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       ];
       const systemPrompt = buildAgentSystemPrompt(cwd);
 
+      let llm: ReturnType<typeof resolveLlmTargets>;
+      try {
+        llm = resolveLlmTargets(apiKey, currentModel, oaicProviders);
+      } catch (err) {
+        appendLog(colors.error(`${icons.error} ${err instanceof Error ? err.message : String(err)}`));
+        appendLog("");
+        setLoading(false);
+        return true;
+      }
+
       const modelContext = modelList.find((m) => m.id === currentModel)?.context_length;
       const maxContextTokens = Math.floor((modelContext ?? CONTEXT_WINDOW_K * 1024) * 0.85);
       const stateBeforeCompress = state;
       setLoadingLabel("Compressing context…");
       setLoading(true);
-      state = await ensureUnderBudget(apiKey, state, systemPrompt, currentModel, {
+      state = await ensureUnderBudget(llm.summarizeRoute, llm.requestModel, state, systemPrompt, {
         maxTokens: maxContextTokens,
         keepLast: 8,
         modelContextLength: modelContext,
@@ -1218,7 +1427,10 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         setLoading(true);
         setLoadingLabel("Thinking…");
 
-        const response = await callApi(apiKey, state, systemPrompt, currentModel, {
+        const loopNudge = identicalToolLoopNudge(state);
+        const apiSystemPrompt = loopNudge ? `${systemPrompt}\n\n${loopNudge}` : systemPrompt;
+
+        const response = await callApi(llm.callRoute, state, apiSystemPrompt, llm.requestModel, {
           onRetry: ({ attempt, maxAttempts, waitMs, status }) => {
             const detail =
               status === 0
@@ -1359,12 +1571,15 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       currentModel,
       messages,
       modelList,
+      oaicProviders,
       appendLog,
       openModelSelector,
       openChatSelector,
       openBraveKeyModal,
       openSearxngModal,
       openHelpModal,
+      openProviderWizard,
+      openProviderRemoveModalFn,
       flushChatSave,
       applyChatRecord,
     ]
@@ -1405,6 +1620,30 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       if (trimmed === "/delete") {
         clearInputDraft();
         await processInput(trimmed);
+        return;
+      }
+      if (trimmed === "/providers") {
+        clearInputDraft();
+        await processInput("/providers");
+        return;
+      }
+      if (
+        trimmed === "/new-provider" ||
+        trimmed === "/add-provider" ||
+        trimmed === "/openai-provider"
+      ) {
+        clearInputDraft();
+        openProviderWizard();
+        return;
+      }
+      if (trimmed === "/remove-provider") {
+        clearInputDraft();
+        if (getOpenAiCompatProviders().length === 0) {
+          appendLog(colors.muted("  No custom providers. Use /new-provider to add one."));
+          appendLog("");
+          return;
+        }
+        openProviderRemoveModalFn();
         return;
       }
       if (trimmed === "/searxng" || trimmed === "/searx") {
@@ -1449,6 +1688,8 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       openBraveKeyModal,
       openSearxngModal,
       openHelpModal,
+      openProviderWizard,
+      openProviderRemoveModalFn,
       clearInputDraft,
     ]
   );
@@ -1470,6 +1711,114 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
     }
     if (showHelpModal) {
       setShowHelpModal(false);
+      return;
+    }
+    if (showProviderWizardModal) {
+      const maxLen = 512;
+      if (key.return) {
+        if (providerWizardStep === 0) {
+          if (!providerWizardUrl.trim()) return;
+          setProviderWizardStep(1);
+          return;
+        }
+        if (providerWizardStep === 1) {
+          setProviderWizardStep(2);
+          return;
+        }
+        try {
+          const baseUrl = normalizeOpenAiBaseUrl(providerWizardUrl);
+          let name = providerWizardName.trim();
+          if (!name) {
+            try {
+              const u = new URL(
+                /^[a-z][a-z0-9+.-]*:\/\//i.test(baseUrl) ? baseUrl : `http://${baseUrl}`
+              );
+              name = u.hostname || "Custom";
+            } catch {
+              name = "Custom";
+            }
+          }
+          upsertOpenAiCompatProvider({
+            name,
+            baseUrl,
+            apiKey: providerWizardKey.trim() || undefined,
+          });
+          setOaicProviders(getOpenAiCompatProviders());
+          appendLog(colors.success(`  Added provider “${name}” → ${baseUrl}`));
+          appendLog(colors.muted("  Open /models to choose a model from this endpoint."));
+          appendLog("");
+        } catch (err) {
+          appendLog(
+            colors.error(`  ${icons.error} ${err instanceof Error ? err.message : String(err)}`)
+          );
+          appendLog("");
+        }
+        setShowProviderWizardModal(false);
+        setProviderWizardStep(0);
+        setProviderWizardUrl("");
+        setProviderWizardName("");
+        setProviderWizardKey("");
+        return;
+      }
+      if (key.escape) {
+        setShowProviderWizardModal(false);
+        setProviderWizardStep(0);
+        setProviderWizardUrl("");
+        setProviderWizardName("");
+        setProviderWizardKey("");
+        return;
+      }
+      if (key.backspace || key.delete) {
+        if (providerWizardStep === 0) setProviderWizardUrl((p) => p.slice(0, -1));
+        else if (providerWizardStep === 1) setProviderWizardName((p) => p.slice(0, -1));
+        else setProviderWizardKey((p) => p.slice(0, -1));
+        return;
+      }
+      if (input && !key.ctrl && !key.meta && input !== "\b" && input !== "\x7f") {
+        if (providerWizardStep === 0) setProviderWizardUrl((p) => (p + input).slice(0, maxLen));
+        else if (providerWizardStep === 1) setProviderWizardName((p) => (p + input).slice(0, 120));
+        else setProviderWizardKey((p) => (p + input).slice(0, maxLen));
+      }
+      return;
+    }
+    if (showProviderRemoveModal) {
+      const list = oaicProviders;
+      if (list.length === 0) {
+        setShowProviderRemoveModal(false);
+        return;
+      }
+      if (key.escape) {
+        setShowProviderRemoveModal(false);
+        return;
+      }
+      if (key.upArrow) setProviderRemoveIndex((i) => Math.max(0, i - 1));
+      else if (key.downArrow) setProviderRemoveIndex((i) => Math.min(list.length - 1, i + 1));
+      else if (key.return) {
+        const sel = list[providerRemoveIndex];
+        if (sel) {
+          const removedId = sel.id;
+          const parsedRm = parseOaicModelId(currentModel);
+          const modelUsesRemoved =
+            !!parsedRm && resolveOaicProvider(oaicProviders, parsedRm.providerKey)?.id === removedId;
+          removeOpenAiCompatProvider(removedId);
+          const next = getOpenAiCompatProviders();
+          setOaicProviders(next);
+          appendLog(colors.muted(`  Removed provider “${sel.name}”.`));
+          appendLog("");
+          void fetchAllModels(apiKey, next).then((refreshed) => {
+            setModelList(refreshed);
+            if (modelUsesRemoved) {
+              const pick =
+                refreshed.find((m) => !parseOaicModelId(m.id))?.id ??
+                refreshed[0]?.id ??
+                "anthropic/claude-sonnet-4";
+              saveModel(pick);
+              setCurrentModel(pick);
+            }
+          });
+        }
+        setShowProviderRemoveModal(false);
+      }
       return;
     }
     if (showRenameChatModal) {
@@ -1673,6 +2022,27 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
             openChatSelector();
             return;
           }
+          if (selected.cmd === "/providers") {
+            clearInputDraft();
+            processInput("/providers").catch((err) => {
+              appendLog(colors.error(`${icons.error} ${err instanceof Error ? err.message : String(err)}`));
+              appendLog("");
+            });
+            return;
+          }
+          if (selected.cmd === "/new-provider") {
+            openProviderWizard();
+            return;
+          }
+          if (selected.cmd === "/remove-provider") {
+            if (getOpenAiCompatProviders().length === 0) {
+              appendLog(colors.muted("  No custom providers to remove."));
+              appendLog("");
+              return;
+            }
+            openProviderRemoveModalFn();
+            return;
+          }
           if (selected.cmd === "/searxng") {
             openSearxngModal();
             return;
@@ -1735,7 +2105,14 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         }
       }
     }
-      if (!showModelSelector && !showPalette && !showChatSelector && !showRenameChatModal) {
+      if (
+        !showModelSelector &&
+        !showPalette &&
+        !showChatSelector &&
+        !showRenameChatModal &&
+        !showProviderWizardModal &&
+        !showProviderRemoveModal
+      ) {
       const inputNow = inputDraftRef.current.value;
       const cursorNow = inputDraftRef.current.cursor;
       const withModifier = key.ctrl || key.meta || key.shift;
@@ -2007,6 +2384,41 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
     );
   }
 
+  if (showProviderRemoveModal) {
+    const rmWidth = Math.min(88, Math.max(64, termColumns - 8));
+    const rmHeight = Math.min(oaicProviders.length + 5, 16);
+    const topPad = Math.max(0, Math.floor((termRows - rmHeight) / 2));
+    const leftPad = Math.max(0, Math.floor((termColumns - rmWidth) / 2));
+    return (
+      <Box flexDirection="column" height={termRows} overflow="hidden">
+        <Box height={topPad} />
+        <Box flexDirection="row">
+          <Box width={leftPad} />
+          <Box
+            flexDirection="column"
+            borderStyle="single"
+            borderColor={inkColors.primary}
+            paddingX={2}
+            paddingY={1}
+            width={rmWidth}
+            minHeight={rmHeight}
+          >
+            <Text bold> Remove OpenAI-compatible provider </Text>
+            <Text color={inkColors.textSecondary}> ↑/↓ select · Enter remove · Esc cancel </Text>
+            {oaicProviders.map((p, i) => (
+              <Text key={p.id} color={i === providerRemoveIndex ? inkColors.primary : undefined}>
+                {i === providerRemoveIndex ? "› " : "  "}
+                {p.name} — {p.baseUrl}
+                <Text color={inkColors.textDisabled}> ({p.slug}) </Text>
+              </Text>
+            ))}
+          </Box>
+        </Box>
+        <Box flexGrow={1} />
+      </Box>
+    );
+  }
+
   if (showModelSelector) {
     const modelModalMaxHeight = 18;
     const modelModalWidth = 108;
@@ -2096,7 +2508,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
                 <Text color={inkColors.primary}> / </Text>
               </Box>
               <Box width={descWidth} flexGrow={0}>
-                <Text color={inkColors.textSecondary}> Commands. Type / then pick: /chats, /new, /fork, /models, /rename, /delete, /compress, /searxng, /brave, /help, /clear, /status, /q. Ctrl+P palette. </Text>
+                <Text color={inkColors.textSecondary}> Commands. Type / then pick: /chats, /new, /fork, /models, /providers, /new-provider, /remove-provider, /rename, /delete, /compress, /searxng, /brave, /help, /clear, /status, /q. Ctrl+P palette. </Text>
               </Box>
             </Box>
             <Box marginTop={1} flexDirection="row" alignItems="flex-start">
@@ -2247,6 +2659,57 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
     );
   }
 
+  if (showProviderWizardModal) {
+    const pvWidth = Math.min(78, Math.max(56, termColumns - 8));
+    const topPad = Math.max(0, Math.floor((termRows - 12) / 2));
+    const leftPad = Math.max(0, Math.floor((termColumns - pvWidth) / 2));
+    const stepLabel =
+      providerWizardStep === 0
+        ? "Base URL (e.g. http://127.0.0.1:11434 or …/v1)"
+        : providerWizardStep === 1
+          ? "Display name (optional — Enter to use hostname)"
+          : "API key (optional)";
+    const stepValue =
+      providerWizardStep === 0
+        ? providerWizardUrl
+        : providerWizardStep === 1
+          ? providerWizardName
+          : providerWizardKey;
+    return (
+      <Box flexDirection="column" height={termRows} overflow="hidden">
+        <Box height={topPad} />
+        <Box flexDirection="row">
+          <Box width={leftPad} />
+          <Box
+            flexDirection="column"
+            borderStyle="single"
+            borderColor={inkColors.primary}
+            paddingX={2}
+            paddingY={1}
+            width={pvWidth}
+          >
+            <Text bold> Add OpenAI-compatible provider </Text>
+            <Text color={inkColors.textSecondary}>
+              {" "}
+              Must expose GET /v1/models and POST /v1/chat/completions. URL is normalized to …/v1.
+            </Text>
+            <Box marginTop={1} flexDirection="column">
+              <Text color={inkColors.primary}>
+                {" "}
+                {providerWizardStep + 1}/3 {stepLabel}
+              </Text>
+              <Box flexDirection="row" marginTop={1}>
+                <Text>{stepValue || "\u00A0"}</Text>
+              </Box>
+            </Box>
+            <Text color={inkColors.textSecondary}> Enter next / save · Esc cancel </Text>
+          </Box>
+        </Box>
+        <Box flexGrow={1} />
+      </Box>
+    );
+  }
+
   if (showPalette) {
     const paletteModalHeight = COMMANDS.length + 4;
     const paletteModalWidth = 52;
@@ -2357,7 +2820,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
           {icons.tool} {tokenDisplay}
         </Text>
         <Text color={inkColors.footerHint}>
-          {` · ${currentModel} · ${keyCreditsFooter} · / ! @ trackpad/↑/↓ scroll Ctrl+J newline Tab queue Esc Esc`}
+          {` · ${currentModel} · ${balanceFooterDisplay} · / ! @ trackpad/↑/↓ scroll Ctrl+J newline Tab queue Esc Esc`}
         </Text>
       </Box>
       <Box flexDirection="column" marginTop={0}>

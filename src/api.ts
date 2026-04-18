@@ -1,4 +1,5 @@
-import { config } from "./config.js";
+import * as crypto from "node:crypto";
+import { config, type OpenAiCompatProvider } from "./config.js";
 import { makeSchema } from "./tools/index.js";
 
 export type ContentBlock = {
@@ -20,7 +21,84 @@ export type ModelsResponse = {
   data: OpenRouterModel[];
 };
 
+/** Prefixed model ids route to `POST .../chat/completions` instead of OpenRouter `/messages`. */
+export const OAIC_MODEL_PREFIX = "oaic:";
+
+export type CallApiRoute =
+  | { kind: "openrouter"; apiKey: string }
+  | { kind: "oaic"; baseUrl: string; apiKey?: string };
+
+export type SummarizeRoute =
+  | { kind: "openrouter"; apiKey: string }
+  | { kind: "oaic"; baseUrl: string; apiKey?: string };
+
+type OpenAiChatMessage =
+  | { role: "system"; content: string }
+  | { role: "user"; content: string }
+  | { role: "assistant"; content: string | null; tool_calls?: OpenAiToolCall[] }
+  | { role: "tool"; tool_call_id: string; content: string };
+
+type OpenAiToolCall = {
+  id: string;
+  type: "function";
+  function: { name: string; arguments: string };
+};
+
 const MAX_RETRIES = 8;
+
+/** vLLM Hermes streaming parser sometimes leaves extra `<tool_call>` blocks in `content`; parse them here. */
+const HERMES_TOOL_CALL_PATTERN = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi;
+
+function oaicRequestTemperature(): number {
+  const raw = process.env.IDEACODE_OAIC_TEMPERATURE?.trim();
+  if (raw === undefined || raw === "") return 0.2;
+  const n = Number.parseFloat(raw);
+  if (!Number.isFinite(n)) return 0.2;
+  return Math.min(2, Math.max(0, n));
+}
+
+function toolUseDedupeKey(name: string, input: Record<string, unknown>): string {
+  const keys = Object.keys(input).sort();
+  const normalized: Record<string, unknown> = {};
+  for (const k of keys) normalized[k] = input[k];
+  return `${name}\0${JSON.stringify(normalized)}`;
+}
+
+/**
+ * Pull Hermes-format tool calls out of plain assistant text so they become structured `tool_use`
+ * blocks (avoids re-sending XML in the next request and fixes partial vLLM parser output).
+ */
+function extractHermesToolCallsFromPlainText(text: string): { stripped: string; blocks: ContentBlock[] } {
+  const blocks: ContentBlock[] = [];
+  if (!text || !/<tool_call>/i.test(text)) {
+    return { stripped: text, blocks: [] };
+  }
+  const re = new RegExp(HERMES_TOOL_CALL_PATTERN.source, HERMES_TOOL_CALL_PATTERN.flags);
+  const stripped = text
+    .replace(re, (_full, inner: string) => {
+      const trimmed = String(inner).trim();
+      if (!trimmed) return "";
+      let parsed: { name?: string; arguments?: unknown; parameters?: unknown };
+      try {
+        parsed = JSON.parse(trimmed) as typeof parsed;
+      } catch {
+        return "";
+      }
+      const name = typeof parsed.name === "string" ? parsed.name.trim() : "";
+      if (!name) return "";
+      const rawArgs = parsed.arguments ?? parsed.parameters;
+      let input: Record<string, unknown> = {};
+      if (rawArgs && typeof rawArgs === "object" && !Array.isArray(rawArgs)) {
+        input = rawArgs as Record<string, unknown>;
+      }
+      const id = `hermes_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+      blocks.push({ type: "tool_use", id, name, input });
+      return "";
+    })
+    .replace(/[ \t]*\n[ \t]*\n[ \t]*/g, "\n\n")
+    .trim();
+  return { stripped, blocks };
+}
 const INITIAL_BACKOFF_MS = 1200;
 const MAX_BACKOFF_MS = 30_000;
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
@@ -156,35 +234,352 @@ export async function fetchModels(apiKey: string): Promise<OpenRouterModel[]> {
   throw lastErr ?? new Error("Failed to fetch models");
 }
 
-export async function callApi(
-  apiKey: string,
+/**
+ * Normalize user input to an OpenAI-style base URL ending with `/v1` (no trailing slash after v1).
+ */
+export function normalizeOpenAiBaseUrl(input: string): string {
+  const raw = input.trim();
+  if (!raw) throw new Error("Base URL is empty");
+  const withProto = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `http://${raw}`;
+  const u = new URL(withProto);
+  let path = u.pathname.replace(/\/$/, "");
+  if (!path.endsWith("/v1")) {
+    path = `${path || ""}/v1`.replace(/\/+/g, "/");
+    if (!path.startsWith("/")) path = `/${path}`;
+  }
+  u.pathname = path;
+  return `${u.origin}${u.pathname}`;
+}
+
+/** Match legacy model ids that used the config UUID instead of the display slug. */
+const OAIC_PROVIDER_KEY_UUID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function resolveOaicProvider(
+  providers: OpenAiCompatProvider[],
+  providerKey: string
+): OpenAiCompatProvider | undefined {
+  if (OAIC_PROVIDER_KEY_UUID.test(providerKey)) {
+    return providers.find((p) => p.id === providerKey);
+  }
+  return providers.find((p) => p.slug === providerKey);
+}
+
+export function formatOaicModelId(providerSlug: string, openAiModelId: string): string {
+  return `${OAIC_MODEL_PREFIX}${providerSlug}/${openAiModelId}`;
+}
+
+/**
+ * Parse `oaic:<providerSlug|legacyUuid>/<openAiModelId>` (model id may contain slashes).
+ */
+export function parseOaicModelId(fullId: string): { providerKey: string; openAiModelId: string } | null {
+  if (!fullId.startsWith(OAIC_MODEL_PREFIX)) return null;
+  const rest = fullId.slice(OAIC_MODEL_PREFIX.length);
+  const i = rest.indexOf("/");
+  if (i <= 0 || i >= rest.length - 1) return null;
+  return { providerKey: rest.slice(0, i), openAiModelId: rest.slice(i + 1) };
+}
+
+/** Rewrite `oaic:<uuid>/…` saved ids to `oaic:<slug>/…` when possible. */
+export function maybeMigrateOaicModelId(
+  fullModelId: string,
+  providers: OpenAiCompatProvider[]
+): string {
+  const parsed = parseOaicModelId(fullModelId);
+  if (!parsed) return fullModelId;
+  const p = resolveOaicProvider(providers, parsed.providerKey);
+  if (!p) return fullModelId;
+  const upgraded = formatOaicModelId(p.slug, parsed.openAiModelId);
+  return upgraded === fullModelId ? fullModelId : upgraded;
+}
+
+function makeOpenAiToolsFromSchema(): Array<{
+  type: "function";
+  function: { name: string; description: string; parameters: Record<string, unknown> };
+}> {
+  return makeSchema().map((t) => ({
+    type: "function" as const,
+    function: {
+      name: t.name,
+      description: t.description,
+      parameters: {
+        type: t.input_schema.type,
+        properties: t.input_schema.properties,
+        required: t.input_schema.required,
+      },
+    },
+  }));
+}
+
+function convertIdeacodeMessagesToOpenAi(
   messages: Array<{ role: string; content: unknown }>,
-  systemPrompt: string,
-  model: string,
+  systemPrompt: string
+): OpenAiChatMessage[] {
+  const out: OpenAiChatMessage[] = [];
+  if (systemPrompt.trim()) {
+    out.push({ role: "system", content: systemPrompt });
+  }
+  for (const m of messages) {
+    if (m.role === "user") {
+      const c = m.content;
+      if (typeof c === "string") {
+        out.push({ role: "user", content: c });
+      } else if (Array.isArray(c)) {
+        for (const item of c) {
+          if (!item || typeof item !== "object") continue;
+          const t = (item as { type?: string }).type;
+          if (t === "tool_result") {
+            const tr = item as { tool_use_id?: string; content?: unknown };
+            const id = tr.tool_use_id ?? "";
+            const text =
+              typeof tr.content === "string" ? tr.content : JSON.stringify(tr.content ?? "");
+            out.push({ role: "tool", tool_call_id: id, content: text });
+          }
+        }
+      }
+    } else if (m.role === "assistant") {
+      const c = m.content;
+      if (typeof c === "string") {
+        const { stripped, blocks: hb } = extractHermesToolCallsFromPlainText(c);
+        if (hb.length > 0) {
+          const toolCalls: OpenAiToolCall[] = hb.map((tu) => ({
+            id: tu.id!,
+            type: "function",
+            function: { name: tu.name!, arguments: JSON.stringify(tu.input ?? {}) },
+          }));
+          out.push({
+            role: "assistant",
+            content: stripped.trim() ? stripped : null,
+            tool_calls: toolCalls,
+          });
+        } else if (c.trim()) {
+          out.push({ role: "assistant", content: c });
+        }
+        continue;
+      }
+      if (!Array.isArray(c)) continue;
+      let textParts = "";
+      const toolCalls: OpenAiToolCall[] = [];
+      for (const b of c) {
+        if (!b || typeof b !== "object") continue;
+        const typ = (b as { type?: string }).type;
+        if (typ === "text") {
+          const tx = (b as { text?: string }).text;
+          if (tx) textParts += tx;
+        } else if (typ === "tool_use") {
+          const name = (b as { name?: string }).name;
+          const input = (b as { input?: Record<string, unknown> }).input ?? {};
+          const id =
+            (b as { id?: string }).id?.trim() ||
+            `tool_${Math.random().toString(36).slice(2, 14)}`;
+          if (name) {
+            toolCalls.push({
+              id,
+              type: "function",
+              function: { name, arguments: JSON.stringify(input) },
+            });
+          }
+        }
+      }
+      const hermesExtra = extractHermesToolCallsFromPlainText(textParts);
+      textParts = hermesExtra.stripped;
+      for (const tu of hermesExtra.blocks) {
+        toolCalls.push({
+          id: tu.id!,
+          type: "function",
+          function: { name: tu.name!, arguments: JSON.stringify(tu.input ?? {}) },
+        });
+      }
+      if (toolCalls.length > 0) {
+        out.push({
+          role: "assistant",
+          content: textParts.trim() ? textParts : null,
+          tool_calls: toolCalls,
+        });
+      } else if (textParts.trim()) {
+        out.push({ role: "assistant", content: textParts });
+      }
+    }
+  }
+  return out;
+}
+
+function parseOpenAiChatCompletion(json: unknown): { content?: ContentBlock[] } {
+  const choices = (json as { choices?: Array<{ message?: Record<string, unknown> }> }).choices;
+  const msg = choices?.[0]?.message;
+  if (!msg) return { content: [] };
+  const blocks: ContentBlock[] = [];
+  const deduped = new Set<string>();
+
+  const apiToolBlocks: ContentBlock[] = [];
+  const toolCalls = msg.tool_calls as
+    | Array<{
+        id?: string;
+        type?: string;
+        function?: { name?: string; arguments?: string };
+      }>
+    | undefined;
+  if (Array.isArray(toolCalls)) {
+    for (const tc of toolCalls) {
+      const id = tc.id;
+      const fn = tc.function;
+      const name = fn?.name;
+      if (!id || !name) continue;
+      let input: Record<string, unknown> = {};
+      if (typeof fn.arguments === "string" && fn.arguments.trim()) {
+        try {
+          input = JSON.parse(fn.arguments) as Record<string, unknown>;
+        } catch {
+          input = {};
+        }
+      }
+      apiToolBlocks.push({ type: "tool_use", id, name, input });
+      deduped.add(toolUseDedupeKey(name, input));
+    }
+  }
+
+  let contentStr = "";
+  const content = msg.content;
+  if (typeof content === "string") {
+    contentStr = content;
+  } else if (Array.isArray(content)) {
+    for (const part of content) {
+      if (!part || typeof part !== "object") continue;
+      const p = part as { type?: string; text?: string };
+      if (p.type === "text" && typeof p.text === "string") {
+        contentStr += p.text;
+      }
+    }
+  }
+
+  const { stripped, blocks: hermesBlocks } = extractHermesToolCallsFromPlainText(contentStr);
+  const hermesFiltered = hermesBlocks.filter((b) => {
+    if (b.type !== "tool_use" || !b.name) return false;
+    const k = toolUseDedupeKey(b.name, (b.input ?? {}) as Record<string, unknown>);
+    if (deduped.has(k)) return false;
+    deduped.add(k);
+    return true;
+  });
+
+  if (stripped.trim()) {
+    blocks.push({ type: "text", text: stripped });
+  }
+  for (const b of apiToolBlocks) {
+    blocks.push(b);
+  }
+  for (const b of hermesFiltered) {
+    blocks.push(b);
+  }
+  return { content: blocks };
+}
+
+function pickPositiveTokenInt(v: unknown): number | undefined {
+  if (typeof v === "number" && Number.isFinite(v) && v > 0) return Math.round(v);
+  return undefined;
+}
+
+/** Best-effort context window from non-OpenRouter `/v1/models` rows (OpenAI, llama.cpp server, etc.). */
+function contextLengthFromOaicModelRow(row: Record<string, unknown>): number | undefined {
+  const direct =
+    pickPositiveTokenInt(row.context_length) ??
+    pickPositiveTokenInt(row.max_model_len) ??
+    pickPositiveTokenInt(row.n_ctx) ??
+    pickPositiveTokenInt(row.n_ctx_train);
+  if (direct) return direct;
+  const meta = row.meta;
+  if (meta && typeof meta === "object" && !Array.isArray(meta)) {
+    const m = meta as Record<string, unknown>;
+    return (
+      pickPositiveTokenInt(m.n_ctx_train) ??
+      pickPositiveTokenInt(m.n_ctx) ??
+      pickPositiveTokenInt(m.context_length)
+    );
+  }
+  return undefined;
+}
+
+type OaicModelListRow = { id: string; context_length?: number };
+
+async function fetchOpenAiCompatModels(baseUrl: string, apiKey?: string): Promise<OaicModelListRow[]> {
+  const root = baseUrl.replace(/\/$/, "");
+  const url = `${root}/models`;
+  const headers: Record<string, string> = {};
+  if (apiKey?.trim()) headers.Authorization = `Bearer ${apiKey.trim()}`;
+  const res = await fetch(url, { headers });
+  if (!res.ok) throw new Error(`models ${res.status}: ${await res.text()}`);
+  const json = (await res.json()) as {
+    data?: Array<Record<string, unknown>>;
+    /** Some servers (e.g. Ollama-style) list models here without `data`. */
+    models?: Array<Record<string, unknown>>;
+  };
+  const fromData = json.data ?? [];
+  const fromModels = json.models ?? [];
+  const rows =
+    fromData.length > 0
+      ? fromData
+      : fromModels.map((m) => {
+          const id = m.model ?? m.name ?? m.id;
+          return typeof id === "string" ? { ...m, id } : m;
+        });
+  const out: OaicModelListRow[] = [];
+  for (const r of rows) {
+    const id = r.id;
+    if (typeof id !== "string" || !id.trim()) continue;
+    const context_length = contextLengthFromOaicModelRow(r);
+    out.push(context_length != null ? { id, context_length } : { id });
+  }
+  return out;
+}
+
+/**
+ * OpenRouter models (when `openRouterKey` is set) plus models from each OpenAI-compatible provider.
+ */
+export async function fetchAllModels(
+  openRouterKey: string | undefined,
+  providers: OpenAiCompatProvider[]
+): Promise<OpenRouterModel[]> {
+  const out: OpenRouterModel[] = [];
+  const key = openRouterKey?.trim();
+  if (key) {
+    try {
+      out.push(...(await fetchModels(key)));
+    } catch {
+      // Missing OpenRouter is OK when using only custom endpoints.
+    }
+  }
+  for (const p of providers) {
+    try {
+      const rows = await fetchOpenAiCompatModels(p.baseUrl, p.apiKey);
+      for (const row of rows) {
+        out.push({
+          id: formatOaicModelId(p.slug, row.id),
+          name: `[${p.name}] ${row.id}`,
+          ...(row.context_length != null ? { context_length: row.context_length } : {}),
+        });
+      }
+    } catch {
+      // Skip unreachable or nonstandard servers.
+    }
+  }
+  return out;
+}
+
+async function postOpenAiChatCompletions(
+  baseUrl: string,
+  apiKey: string | undefined,
+  body: Record<string, unknown>,
   callbacks?: {
-    /** `status` is HTTP code when retrying 5xx/429, or `0` when retrying a dropped connection (fetch failed). */
     onRetry?: (info: { attempt: number; maxAttempts: number; waitMs: number; status: number }) => void;
   }
-): Promise<{ content?: ContentBlock[] }> {
-  const body = {
-    model,
-    max_tokens: 8192,
-    system: systemPrompt,
-    messages,
-    tools: makeSchema(),
-  };
+): Promise<Response> {
+  const url = `${baseUrl.replace(/\/$/, "")}/chat/completions`;
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (apiKey?.trim()) headers.Authorization = `Bearer ${apiKey.trim()}`;
   let lastError: Error | null = null;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     let res: Response;
     try {
-      res = await fetch(config.apiUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify(body),
-      });
+      res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
     } catch (fetchErr) {
       lastError = fetchErr instanceof Error ? fetchErr : new Error(String(fetchErr));
       if (isRetryableNetworkFailure(fetchErr) && attempt < MAX_RETRIES) {
@@ -199,10 +594,10 @@ export async function callApi(
         continue;
       }
       throw new Error(
-        `OpenRouter connection failed${isRetryableNetworkFailure(fetchErr) ? " after retries" : ""}: ${lastError.message}`
+        `OpenAI-compatible connection failed${isRetryableNetworkFailure(fetchErr) ? " after retries" : ""}: ${lastError.message}`
       );
     }
-    if (res.ok) return res.json();
+    if (res.ok) return res;
     const text = await res.text();
     lastError = new Error(`API ${res.status}: ${text}`);
     if (RETRYABLE_STATUS.has(res.status) && attempt < MAX_RETRIES) {
@@ -220,6 +615,90 @@ export async function callApi(
     throw lastError;
   }
   throw lastError;
+}
+
+export async function callApi(
+  route: CallApiRoute,
+  messages: Array<{ role: string; content: unknown }>,
+  systemPrompt: string,
+  requestModel: string,
+  callbacks?: {
+    /** `status` is HTTP code when retrying 5xx/429, or `0` when retrying a dropped connection (fetch failed). */
+    onRetry?: (info: { attempt: number; maxAttempts: number; waitMs: number; status: number }) => void;
+  }
+): Promise<{ content?: ContentBlock[] }> {
+  if (route.kind === "openrouter") {
+    const body = {
+      model: requestModel,
+      max_tokens: 8192,
+      system: systemPrompt,
+      messages,
+      tools: makeSchema(),
+    };
+    let lastError: Error | null = null;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      let res: Response;
+      try {
+        res = await fetch(config.apiUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${route.apiKey}`,
+          },
+          body: JSON.stringify(body),
+        });
+      } catch (fetchErr) {
+        lastError = fetchErr instanceof Error ? fetchErr : new Error(String(fetchErr));
+        if (isRetryableNetworkFailure(fetchErr) && attempt < MAX_RETRIES) {
+          const waitMs = computeRetryDelayMs(attempt, null);
+          callbacks?.onRetry?.({
+            attempt: attempt + 1,
+            maxAttempts: MAX_RETRIES + 1,
+            waitMs,
+            status: 0,
+          });
+          await sleep(waitMs);
+          continue;
+        }
+        throw new Error(
+          `OpenRouter connection failed${isRetryableNetworkFailure(fetchErr) ? " after retries" : ""}: ${lastError.message}`
+        );
+      }
+      if (res.ok) return res.json() as Promise<{ content?: ContentBlock[] }>;
+      const text = await res.text();
+      lastError = new Error(`API ${res.status}: ${text}`);
+      if (RETRYABLE_STATUS.has(res.status) && attempt < MAX_RETRIES) {
+        const retryAfter = res.headers.get("retry-after");
+        const waitMs = computeRetryDelayMs(attempt, retryAfter);
+        callbacks?.onRetry?.({
+          attempt: attempt + 1,
+          maxAttempts: MAX_RETRIES + 1,
+          waitMs,
+          status: res.status,
+        });
+        await sleep(waitMs);
+        continue;
+      }
+      throw lastError;
+    }
+    throw lastError;
+  }
+
+  const oaMessages = convertIdeacodeMessagesToOpenAi(messages, systemPrompt);
+  const body = {
+    model: requestModel,
+    max_tokens: 8192,
+    messages: oaMessages,
+    tools: makeOpenAiToolsFromSchema(),
+    tool_choice: "auto" as const,
+    /** Non-streaming avoids vLLM Hermes parser gaps (e.g. multiple `<tool_call>` in one chunk). */
+    stream: false as const,
+    /** Lower default reduces malformed Hermes tool markup; override with IDEACODE_OAIC_TEMPERATURE. */
+    temperature: oaicRequestTemperature(),
+  };
+  const res = await postOpenAiChatCompletions(route.baseUrl, route.apiKey, body, callbacks);
+  const json = (await res.json()) as unknown;
+  return parseOpenAiChatCompletion(json);
 }
 
 export type StreamCallbacks = {
@@ -515,63 +994,79 @@ function chunkMessagesForSummarize(
   return chunks;
 }
 
-async function openRouterSummarizeRequest(
-  apiKey: string,
-  model: string,
+async function summarizeOneRequest(
+  route: SummarizeRoute,
+  requestModel: string,
   system: string,
   messages: Array<{ role: string; content: unknown }>,
   maxTokens: number
 ): Promise<string> {
-  const body = {
-    model,
-    max_tokens: maxTokens,
-    system,
-    messages,
-  };
-  let lastError: Error | null = null;
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    let res: Response;
-    try {
-      res = await fetch(config.apiUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify(body),
-      });
-    } catch (fetchErr) {
-      lastError = fetchErr instanceof Error ? fetchErr : new Error(String(fetchErr));
-      if (isRetryableNetworkFailure(fetchErr) && attempt < MAX_RETRIES) {
-        await sleep(computeRetryDelayMs(attempt, null));
+  if (route.kind === "openrouter") {
+    const body = {
+      model: requestModel,
+      max_tokens: maxTokens,
+      system,
+      messages,
+    };
+    let lastError: Error | null = null;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      let res: Response;
+      try {
+        res = await fetch(config.apiUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${route.apiKey}`,
+          },
+          body: JSON.stringify(body),
+        });
+      } catch (fetchErr) {
+        lastError = fetchErr instanceof Error ? fetchErr : new Error(String(fetchErr));
+        if (isRetryableNetworkFailure(fetchErr) && attempt < MAX_RETRIES) {
+          await sleep(computeRetryDelayMs(attempt, null));
+          continue;
+        }
+        throw new Error(
+          `Summarize connection failed${isRetryableNetworkFailure(fetchErr) ? " after retries" : ""}: ${lastError.message}`
+        );
+      }
+      if (res.ok) {
+        const data = (await res.json()) as { content?: ContentBlock[] };
+        const blocks = data.content ?? [];
+        const textBlock = blocks.find((b) => b.type === "text" && b.text);
+        return (textBlock?.text ?? "").trim();
+      }
+      const text = await res.text();
+      lastError = new Error(`Summarize API ${res.status}: ${text}`);
+      if (RETRYABLE_STATUS.has(res.status) && attempt < MAX_RETRIES) {
+        const retryAfter = res.headers.get("retry-after");
+        const waitMs = computeRetryDelayMs(attempt, retryAfter);
+        await sleep(waitMs);
         continue;
       }
-      throw new Error(
-        `Summarize connection failed${isRetryableNetworkFailure(fetchErr) ? " after retries" : ""}: ${lastError.message}`
-      );
-    }
-    if (res.ok) {
-      const data = (await res.json()) as { content?: ContentBlock[] };
-      const blocks = data.content ?? [];
-      const textBlock = blocks.find((b) => b.type === "text" && b.text);
-      return (textBlock?.text ?? "").trim();
-    }
-    const text = await res.text();
-    lastError = new Error(`Summarize API ${res.status}: ${text}`);
-    if (RETRYABLE_STATUS.has(res.status) && attempt < MAX_RETRIES) {
-      const retryAfter = res.headers.get("retry-after");
-      const waitMs = computeRetryDelayMs(attempt, retryAfter);
-      await sleep(waitMs);
-      continue;
+      throw lastError;
     }
     throw lastError;
   }
-  throw lastError;
+
+  const oaMessages = convertIdeacodeMessagesToOpenAi(messages, system);
+  const body = {
+    model: requestModel,
+    max_tokens: maxTokens,
+    messages: oaMessages,
+    stream: false as const,
+    temperature: oaicRequestTemperature(),
+  };
+  const res = await postOpenAiChatCompletions(route.baseUrl, route.apiKey, body);
+  const json = (await res.json()) as unknown;
+  const blocks = parseOpenAiChatCompletion(json).content ?? [];
+  const textBlock = blocks.find((b) => b.type === "text" && b.text);
+  return (textBlock?.text ?? "").trim();
 }
 
 async function mergePartialSummaryStrings(
-  apiKey: string,
-  model: string,
+  route: SummarizeRoute,
+  requestModel: string,
   partials: string[],
   contextLengthTokens: number | undefined
 ): Promise<string> {
@@ -619,11 +1114,13 @@ async function mergePartialSummaryStrings(
     const mergeMessages = [{ role: "user" as const, content: userContent }];
     const desiredOut = plannedMergeOutputBudget(contextLengthTokens, isFinalRound);
     const maxOut = capMaxOutputTokens(contextT, MERGE_SUMMARIES_SYSTEM, mergeMessages, desiredOut);
-    merged.push(await openRouterSummarizeRequest(apiKey, model, MERGE_SUMMARIES_SYSTEM, mergeMessages, maxOut));
+    merged.push(
+      await summarizeOneRequest(route, requestModel, MERGE_SUMMARIES_SYSTEM, mergeMessages, maxOut)
+    );
   }
 
   if (merged.length === 1) return merged[0]!.trim();
-  return mergePartialSummaryStrings(apiKey, model, merged, contextLengthTokens);
+  return mergePartialSummaryStrings(route, requestModel, merged, contextLengthTokens);
 }
 
 export type CallSummarizeOptions = {
@@ -636,9 +1133,9 @@ export type CallSummarizeOptions = {
  * fraction of the model context (so summarization works on huge histories).
  */
 export async function callSummarize(
-  apiKey: string,
+  route: SummarizeRoute,
+  requestModel: string,
   messages: Array<{ role: string; content: unknown }>,
-  model: string,
   options?: CallSummarizeOptions
 ): Promise<string> {
   if (messages.length === 0) return "";
@@ -654,7 +1151,7 @@ export async function callSummarize(
       Math.floor(contextT * MERGE_FINAL_OUTPUT_FRACTION)
     );
     const maxOut = capMaxOutputTokens(contextT, SUMMARIZE_SYSTEM, messages, desiredOut);
-    return openRouterSummarizeRequest(apiKey, model, SUMMARIZE_SYSTEM, messages, maxOut);
+    return summarizeOneRequest(route, requestModel, SUMMARIZE_SYSTEM, messages, maxOut);
   }
 
   const chunkOutReserve = plannedChunkOutputBudget(ctx);
@@ -667,7 +1164,7 @@ export async function callSummarize(
   );
   for (const ch of chunks) {
     const maxOut = capMaxOutputTokens(contextT, SUMMARIZE_SYSTEM, ch, desiredChunkOut);
-    partials.push(await openRouterSummarizeRequest(apiKey, model, SUMMARIZE_SYSTEM, ch, maxOut));
+    partials.push(await summarizeOneRequest(route, requestModel, SUMMARIZE_SYSTEM, ch, maxOut));
   }
-  return mergePartialSummaryStrings(apiKey, model, partials, options?.contextLengthTokens);
+  return mergePartialSummaryStrings(route, requestModel, partials, options?.contextLengthTokens);
 }

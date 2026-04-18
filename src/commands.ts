@@ -20,6 +20,13 @@ export const COMMANDS: Command[] = [
   { cmd: "/rename", desc: "Rename this chat (optional: /rename title)" },
   { cmd: "/delete", desc: "Delete this chat" },
   { cmd: "/models", desc: "Switch model", aliases: ["/model"] },
+  { cmd: "/providers", desc: "List OpenAI-compatible providers" },
+  {
+    cmd: "/new-provider",
+    desc: "Add OpenAI-compatible API URL (vLLM, Ollama, etc.)",
+    aliases: ["/add-provider", "/openai-provider"],
+  },
+  { cmd: "/remove-provider", desc: "Remove a custom OpenAI-compatible provider" },
   { cmd: "/searxng", desc: "Set SearXNG base URL (web search, preferred)", aliases: ["/searx"] },
   { cmd: "/brave", desc: "Set Brave Search API key (web search fallback)", aliases: ["/brave-key"] },
   { cmd: "/help", desc: "Show help", aliases: ["/?"] },

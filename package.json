@@ -28,6 +28,7 @@
     "format": "prettier --write \"src/**/*.{ts,tsx,json}\"",
     "fmt": "npm run format",
     "test:web-search": "tsx src/tools/web-search.test.ts",
+    "test:web-fetch": "tsx src/tools/web-fetch.test.ts",
     "postinstall": "patch-package && npx playwright install chromium"
   },
   "dependencies": {

@@ -3,7 +3,7 @@ import "dotenv/config";
 import { writeSync } from "node:fs";
 import { render } from "ink";
 import React from "react";
-import { getApiKey } from "./config.js";
+import { getApiKey, getOpenAiCompatProviders } from "./config.js";
 import { getVersion } from "./version.js";
 import { runOnboarding } from "./onboarding.js";
 import { Repl } from "./repl.js";
@@ -43,12 +43,12 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  let apiKey = getApiKey();
-  if (!apiKey) {
+  let apiKey = getApiKey() ?? "";
+  if (!apiKey.trim() && getOpenAiCompatProviders().length === 0) {
     await runOnboarding();
-    apiKey = getApiKey();
+    apiKey = getApiKey() ?? "";
   }
-  if (!apiKey) {
+  if (!apiKey.trim() && getOpenAiCompatProviders().length === 0) {
     process.exit(1);
   }
 

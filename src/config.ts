@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as crypto from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
 
@@ -13,6 +14,45 @@ export function getConfigDir(): string {
   return CONFIG_DIR;
 }
 
+/** User-defined OpenAI-compatible API (vLLM, Ollama OpenAI surface, etc.). */
+export type OpenAiCompatProvider = {
+  id: string;
+  /** Short stable label for model ids: `oaic:<slug>/<model>`. */
+  slug: string;
+  name: string;
+  /** Normalized base including `/v1` (no trailing slash). */
+  baseUrl: string;
+  apiKey?: string;
+};
+
+/** URL-safe slug from display name (may be further uniquified with allocateProviderSlug). */
+export function slugifyProviderLabel(name: string): string {
+  let s = name
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9-]/g, "")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  if (!s) s = "provider";
+  return s.slice(0, 48);
+}
+
+/** Next unused slug: `base`, or `base-<idprefix>`, etc. */
+export function allocateProviderSlug(name: string, id: string, taken: Set<string>): string {
+  const base = slugifyProviderLabel(name);
+  let candidate = base;
+  if (!taken.has(candidate)) return candidate;
+  const short = id.replace(/-/g, "").slice(0, 8);
+  candidate = `${base}-${short}`;
+  let n = 0;
+  while (taken.has(candidate)) {
+    n += 1;
+    candidate = `${base}-${short}${n}`;
+  }
+  return candidate;
+}
+
 export type StoredConfig = {
   apiKey?: string;
   model?: string;
@@ -21,6 +61,8 @@ export type StoredConfig = {
   searxngUrl?: string;
   /** Persisted active chat id (conversations/chats/<id>.json). */
   activeChatId?: string;
+  /** Extra LLM backends that speak OpenAI `/v1/chat/completions` + `/v1/models`. */
+  openAiCompatProviders?: OpenAiCompatProvider[];
 };
 
 function loadConfigFile(): StoredConfig {
@@ -112,6 +154,87 @@ export function saveActiveChatId(chatId: string): void {
   const config = loadConfigFile();
   config.activeChatId = chatId || undefined;
   saveConfigFile(config);
+}
+
+type RawOpenAiCompatRow = {
+  id: string;
+  name: string;
+  baseUrl: string;
+  apiKey?: string;
+  slug?: string;
+};
+
+export function getOpenAiCompatProviders(): OpenAiCompatProvider[] {
+  const raw = loadConfigFile().openAiCompatProviders;
+  if (!Array.isArray(raw)) return [];
+  const valid: RawOpenAiCompatRow[] = [];
+  for (const p of raw) {
+    if (
+      p &&
+      typeof p === "object" &&
+      typeof (p as RawOpenAiCompatRow).id === "string" &&
+      typeof (p as RawOpenAiCompatRow).baseUrl === "string" &&
+      typeof (p as RawOpenAiCompatRow).name === "string"
+    ) {
+      valid.push(p as RawOpenAiCompatRow);
+    }
+  }
+  const taken = new Set<string>();
+  const out: OpenAiCompatProvider[] = [];
+  let migrated = false;
+  for (const p of valid) {
+    const fromFile = typeof p.slug === "string" ? p.slug.trim() : "";
+    let slug = fromFile;
+    if (slug && !taken.has(slug)) {
+      taken.add(slug);
+    } else {
+      if (fromFile) migrated = true;
+      slug = allocateProviderSlug(p.name, p.id, taken);
+      taken.add(slug);
+      if (fromFile !== slug) migrated = true;
+    }
+    if (!fromFile) migrated = true;
+    out.push({
+      id: p.id,
+      name: p.name,
+      baseUrl: p.baseUrl,
+      apiKey: p.apiKey,
+      slug,
+    });
+  }
+  if (migrated) saveOpenAiCompatProviders(out);
+  return out;
+}
+
+export function saveOpenAiCompatProviders(list: OpenAiCompatProvider[]): void {
+  const config = loadConfigFile();
+  config.openAiCompatProviders = list.length > 0 ? list : undefined;
+  saveConfigFile(config);
+}
+
+export function upsertOpenAiCompatProvider(entry: {
+  name: string;
+  baseUrl: string;
+  apiKey?: string;
+}): OpenAiCompatProvider {
+  const id = crypto.randomUUID();
+  const list = getOpenAiCompatProviders();
+  const taken = new Set(list.map((p) => p.slug));
+  const slug = allocateProviderSlug(entry.name.trim(), id, taken);
+  const row: OpenAiCompatProvider = {
+    id,
+    slug,
+    name: entry.name.trim(),
+    baseUrl: entry.baseUrl.trim(),
+    apiKey: entry.apiKey?.trim() || undefined,
+  };
+  list.push(row);
+  saveOpenAiCompatProviders(list);
+  return row;
+}
+
+export function removeOpenAiCompatProvider(id: string): void {
+  saveOpenAiCompatProviders(getOpenAiCompatProviders().filter((p) => p.id !== id));
 }
 
 export const config = {
