@@ -89,6 +89,13 @@ function wordEndForward(value: string, cursor: number): number {
   return i;
 }
 
+/** Split a string into log rows; mirrors appendLog newline handling. */
+function splitLogLines(line: string): string[] {
+  const lines = line.split("\n");
+  if (lines.length > 1 && lines[0] === "") lines.shift();
+  return lines;
+}
+
 const CONTEXT_WINDOW_K = 128;
 const MAX_TOOL_RESULT_CHARS = 3500;
 const MAX_AT_SUGGESTIONS = 12;
@@ -1017,10 +1024,25 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
   const lastLogLineRef = useRef("");
 
   const appendLog = useCallback((line: string) => {
-    const lines = line.split("\n");
-    if (lines.length > 1 && lines[0] === "") lines.shift();
+    const lines = splitLogLines(line);
     setLogLines((prev) => {
       const next = [...prev, ...lines];
+      lastLogLineRef.current = next[next.length - 1] ?? "";
+      return next;
+    });
+  }, []);
+
+  /**
+   * Status / feedback lines: insert a blank row above when the committed log’s last line has visible
+   * content. Uses functional `setLogLines` so spacing is correct even if `lastLogLineRef` has not
+   * flushed yet after the previous `appendLog`.
+   */
+  const appendNotifyLog = useCallback((line: string) => {
+    const incoming = splitLogLines(line);
+    setLogLines((prev) => {
+      const lastRow = prev[prev.length - 1] ?? "";
+      const spacerNeeded = lastRow.trim() !== "";
+      const next = spacerNeeded ? [...prev, "", ...incoming] : [...prev, ...incoming];
       lastLogLineRef.current = next[next.length - 1] ?? "";
       return next;
     });
@@ -1029,10 +1051,12 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
   useEffect(() => {
     const version = getVersion();
     checkForUpdate(version, (latest) => {
-      appendLog(colors.warn(`  Update available: ideacode ${latest} (you have ${version}). Run: npm i -g ideacode`));
+      appendNotifyLog(
+        colors.warn(`  Update available: ideacode ${latest} (you have ${version}). Run: npm i -g ideacode`)
+      );
       appendLog("");
     });
-  }, [appendLog]);
+  }, [appendLog, appendNotifyLog]);
 
   /** Trimmed key shown when modal opened (env or file); used to detect real changes on Enter. */
   const braveKeyInitialRef = useRef("");
@@ -1147,13 +1171,13 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       if (canonical === "/providers") {
         const list = getOpenAiCompatProviders();
         if (list.length === 0) {
-          appendLog(
+          appendNotifyLog(
             colors.muted(
               "  No custom OpenAI-compatible providers. Use /new-provider to add one (expects GET/POST …/v1/models and …/v1/chat/completions)."
             )
           );
         } else {
-          appendLog(colors.muted("  OpenAI-compatible providers:"));
+          appendNotifyLog(colors.muted("  OpenAI-compatible providers:"));
           for (const p of list) {
             appendLog(
               colors.muted(`    · ${p.name}`) +
@@ -1175,7 +1199,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       if (canonical === "/remove-provider") {
         const list = getOpenAiCompatProviders();
         if (list.length === 0) {
-          appendLog(colors.muted("  No custom providers. Use /new-provider to add one."));
+          appendNotifyLog(colors.muted("  No custom providers. Use /new-provider to add one."));
           appendLog("");
           return true;
         }
@@ -1189,7 +1213,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       if (canonical === "/new") {
         const rec = createNewChat(cwd);
         applyChatRecord(rec);
-        appendLog(colors.muted(`  Started new chat “${rec.title}”.`));
+        appendNotifyLog(colors.muted(`  Started new chat “${rec.title}”.`));
         appendLog("");
         return true;
       }
@@ -1202,15 +1226,14 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
             sourceTitle: parent?.title,
           });
           applyChatRecord(rec);
-          appendLog("");
-          appendLog(
+          appendNotifyLog(
             colors.muted(
               `  Forked into new chat “${rec.title}” (${rec.messages.length} messages). Original chat is unchanged.`
             )
           );
           appendLog("");
         } catch (err) {
-          appendLog(colors.error(`${icons.error} ${err instanceof Error ? err.message : String(err)}`));
+          appendNotifyLog(colors.error(`${icons.error} ${err instanceof Error ? err.message : String(err)}`));
           appendLog("");
         }
         return true;
@@ -1229,7 +1252,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
               updatedAt: new Date().toISOString(),
             });
           }
-          appendLog(colors.muted(`  Chat title set to “${rest.slice(0, 120)}”.`));
+          appendNotifyLog(colors.muted(`  Chat title set to “${rest.slice(0, 120)}”.`));
           appendLog("");
           return true;
         }
@@ -1252,7 +1275,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
           nextRecord = createNewChat(cwd);
         }
         applyChatRecord(nextRecord);
-        appendLog(colors.muted(`  Chat deleted. Now in “${nextRecord.title}”.`));
+        appendNotifyLog(colors.muted(`  Chat deleted. Now in “${nextRecord.title}”.`));
         appendLog("");
         return true;
       }
@@ -1283,7 +1306,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
           searchBits.length > 0
             ? colors.muted(`  web_search: ${searchBits.join(" · ")}`)
             : colors.muted("  web_search: (not configured — /searxng or /brave)");
-        appendLog(
+        appendNotifyLog(
           colors.muted(`  Chat: ${title}`) +
             colors.dim(` · ${shortId}…`) +
             colors.dim(" · ") +
@@ -1306,7 +1329,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       }
       if (canonical === "/compress") {
         if (messages.length === 0) {
-          appendLog(colors.muted("  Nothing to compress (no messages yet)."));
+          appendNotifyLog(colors.muted("  Nothing to compress (no messages yet)."));
           appendLog("");
           return true;
         }
@@ -1316,7 +1339,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
             models = await fetchAllModels(apiKey, oaicProviders);
             setModelList(models);
           } catch (err) {
-            appendLog(
+            appendNotifyLog(
               colors.warn(
                 `  Could not load model list (${err instanceof Error ? err.message : String(err)}); using 128K default for compress target.`
               )
@@ -1332,7 +1355,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         try {
           ({ summarizeRoute, requestModel } = resolveLlmTargets(apiKey, currentModel, oaicProviders));
         } catch (err) {
-          appendLog(colors.error(`${icons.error} ${err instanceof Error ? err.message : String(err)}`));
+          appendNotifyLog(colors.error(`${icons.error} ${err instanceof Error ? err.message : String(err)}`));
           appendLog("");
           return true;
         }
@@ -1352,13 +1375,13 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
           setMessages(result.messages);
           const kb = (n: number) => `${Math.round(n / 1000)}K`;
           if (!result.changed) {
-            appendLog(
+            appendNotifyLog(
               colors.muted(
                 `  Context already within budget (~${kb(result.tokensAfter)} est. tokens, target ≤${kb(result.targetMaxTokens)}).`
               )
             );
           } else {
-            appendLog(
+            appendNotifyLog(
               colors.muted(
                 `  Compressed ~${kb(result.tokensBefore)} → ~${kb(result.tokensAfter)} est. tokens (target ≤${kb(result.targetMaxTokens)}).`
               ) +
@@ -1369,7 +1392,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
           }
           appendLog("");
         } catch (err) {
-          appendLog(colors.error(`${icons.error} ${err instanceof Error ? err.message : String(err)}`));
+          appendNotifyLog(colors.error(`${icons.error} ${err instanceof Error ? err.message : String(err)}`));
           appendLog("");
         } finally {
           setLoading(false);
@@ -1398,7 +1421,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       try {
         llm = resolveLlmTargets(apiKey, currentModel, oaicProviders);
       } catch (err) {
-        appendLog(colors.error(`${icons.error} ${err instanceof Error ? err.message : String(err)}`));
+        appendNotifyLog(colors.error(`${icons.error} ${err instanceof Error ? err.message : String(err)}`));
         appendLog("");
         setLoading(false);
         return true;
@@ -1418,7 +1441,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       // updates as soon as compression runs (otherwise it stays stale until setMessages at turn end).
       setMessages(state);
       if (state.length < stateBeforeCompress.length) {
-        appendLog(colors.muted("  (context compressed to stay under limit)\n"));
+        appendNotifyLog(colors.muted("  (context compressed to stay under limit)\n"));
       }
 
       setLoadingLabel("Thinking…");
@@ -1449,14 +1472,14 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
           emptyAssistantRetries += 1;
           if (emptyAssistantRetries <= MAX_EMPTY_ASSISTANT_RETRIES) {
             setLoadingLabel(`No output yet, retrying ${emptyAssistantRetries}/${MAX_EMPTY_ASSISTANT_RETRIES}…`);
-            appendLog(
+            appendNotifyLog(
               colors.muted(
                 `  ${icons.tool} model returned an empty turn, retrying (${emptyAssistantRetries}/${MAX_EMPTY_ASSISTANT_RETRIES})…`
               )
             );
             continue;
           }
-          appendLog(
+          appendNotifyLog(
             colors.error(
               `${icons.error} model returned empty output repeatedly. Stopping this turn; you can submit "continue" to resume.`
             )
@@ -1525,8 +1548,15 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         let parallelBatch: PlannedToolCall[] = [];
         for (const block of contentBlocks) {
           if (block.type === "text" && block.text?.trim()) {
-            if (lastLogLineRef.current !== "") appendLog("");
-            appendLog(agentMessage(block.text).trimEnd());
+            const payload = agentMessage(block.text).trimEnd();
+            const textLines = splitLogLines(payload);
+            setLogLines((prev) => {
+              const lastRow = prev[prev.length - 1] ?? "";
+              const spacerNeeded = lastRow.trim() !== "";
+              const next = spacerNeeded ? [...prev, "", ...textLines] : [...prev, ...textLines];
+              lastLogLineRef.current = next[next.length - 1] ?? "";
+              return next;
+            });
             continue;
           }
           if (block.type !== "tool_use" || !block.name || !block.input) continue;
@@ -1573,6 +1603,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       modelList,
       oaicProviders,
       appendLog,
+      appendNotifyLog,
       openModelSelector,
       openChatSelector,
       openBraveKeyModal,
@@ -1639,7 +1670,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       if (trimmed === "/remove-provider") {
         clearInputDraft();
         if (getOpenAiCompatProviders().length === 0) {
-          appendLog(colors.muted("  No custom providers. Use /new-provider to add one."));
+          appendNotifyLog(colors.muted("  No custom providers. Use /new-provider to add one."));
           appendLog("");
           return;
         }
@@ -1675,7 +1706,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         }
       } catch (err) {
         setLoading(false);
-        appendLog(colors.error(`${icons.error} ${err instanceof Error ? err.message : String(err)}`));
+        appendNotifyLog(colors.error(`${icons.error} ${err instanceof Error ? err.message : String(err)}`));
         appendLog("");
       }
     },
@@ -1683,6 +1714,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
       processInput,
       handleQuit,
       appendLog,
+      appendNotifyLog,
       openModelSelector,
       openChatSelector,
       openBraveKeyModal,
@@ -1744,11 +1776,11 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
             apiKey: providerWizardKey.trim() || undefined,
           });
           setOaicProviders(getOpenAiCompatProviders());
-          appendLog(colors.success(`  Added provider “${name}” → ${baseUrl}`));
+          appendNotifyLog(colors.success(`  Added provider “${name}” → ${baseUrl}`));
           appendLog(colors.muted("  Open /models to choose a model from this endpoint."));
           appendLog("");
         } catch (err) {
-          appendLog(
+          appendNotifyLog(
             colors.error(`  ${icons.error} ${err instanceof Error ? err.message : String(err)}`)
           );
           appendLog("");
@@ -1803,7 +1835,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
           removeOpenAiCompatProvider(removedId);
           const next = getOpenAiCompatProviders();
           setOaicProviders(next);
-          appendLog(colors.muted(`  Removed provider “${sel.name}”.`));
+          appendNotifyLog(colors.muted(`  Removed provider “${sel.name}”.`));
           appendLog("");
           void fetchAllModels(apiKey, next).then((refreshed) => {
             setModelList(refreshed);
@@ -1833,7 +1865,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
             titleManuallySet: true,
             updatedAt: new Date().toISOString(),
           });
-          appendLog(colors.muted(`  Chat title set to “${title}”.`));
+          appendNotifyLog(colors.muted(`  Chat title set to “${title}”.`));
           appendLog("");
         }
         setShowRenameChatModal(false);
@@ -1856,13 +1888,13 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         setSearxngInput("");
         const envOverride = Boolean(process.env.SEARXNG_URL?.trim());
         if (toSave) {
-          appendLog(
+          appendNotifyLog(
             envOverride
               ? colors.success("SearXNG URL saved to config. SEARXNG_URL in environment still takes priority.")
               : colors.success("SearXNG URL saved. web_search will use this instance first.")
           );
         } else {
-          appendLog(
+          appendNotifyLog(
             envOverride
               ? colors.muted("Cleared saved SearXNG URL. SEARXNG_URL env is still set.")
               : colors.muted("Cleared saved SearXNG URL.")
@@ -1886,20 +1918,20 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         setShowBraveKeyModal(false);
         setBraveKeyInput("");
         if (unchanged) {
-          appendLog(colors.muted("Brave key unchanged."));
+          appendNotifyLog(colors.muted("Brave key unchanged."));
         } else {
           saveBraveSearchApiKey(trimmed);
           const envOverride = Boolean(
             process.env.BRAVE_API_KEY?.trim() || process.env.BRAVE_SEARCH_API_KEY?.trim()
           );
           if (trimmed) {
-            appendLog(
+            appendNotifyLog(
               colors.success(
                 "Brave Search API key saved. Used as web_search fallback after SearXNG (if configured)."
               )
             );
           } else {
-            appendLog(
+            appendNotifyLog(
               envOverride
                 ? colors.muted(
                     "Brave key removed from config. BRAVE_API_KEY / BRAVE_SEARCH_API_KEY in environment still applies."
@@ -1936,8 +1968,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
           const rec = loadChatRecord(selected.id);
           if (rec) {
             applyChatRecord(rec);
-            appendLog("");
-            appendLog(colors.success(`Switched to “${rec.title}”`));
+            appendNotifyLog(colors.success(`Switched to “${rec.title}”`));
             appendLog("");
           }
         }
@@ -1959,7 +1990,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         if (selected) {
           saveModel(selected);
           setCurrentModel(selected);
-          appendLog(colors.success(`Model set to ${selected}`));
+          appendNotifyLog(colors.success(`Model set to ${selected}`));
           appendLog("");
         }
         setShowModelSelector(false);
@@ -1984,7 +2015,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
             processInput(selected.cmd).then((cont) => {
               if (!cont) handleQuit();
             }).catch((err) => {
-              appendLog(colors.error(`${icons.error} ${err instanceof Error ? err.message : String(err)}`));
+              appendNotifyLog(colors.error(`${icons.error} ${err instanceof Error ? err.message : String(err)}`));
               appendLog("");
             });
           }
@@ -2025,7 +2056,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
           if (selected.cmd === "/providers") {
             clearInputDraft();
             processInput("/providers").catch((err) => {
-              appendLog(colors.error(`${icons.error} ${err instanceof Error ? err.message : String(err)}`));
+              appendNotifyLog(colors.error(`${icons.error} ${err instanceof Error ? err.message : String(err)}`));
               appendLog("");
             });
             return;
@@ -2036,7 +2067,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
           }
           if (selected.cmd === "/remove-provider") {
             if (getOpenAiCompatProviders().length === 0) {
-              appendLog(colors.muted("  No custom providers to remove."));
+              appendNotifyLog(colors.muted("  No custom providers to remove."));
               appendLog("");
               return;
             }
@@ -2058,7 +2089,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
           processInput(selected.cmd).then((cont) => {
             if (!cont) handleQuit();
           }).catch((err) => {
-            appendLog(colors.error(`${icons.error} ${err instanceof Error ? err.message : String(err)}`));
+            appendNotifyLog(colors.error(`${icons.error} ${err instanceof Error ? err.message : String(err)}`));
             appendLog("");
           });
           return;
@@ -2139,7 +2170,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
         if (inputNow.trim()) {
           queuedMessageRef.current = inputNow;
           applyInputMutation("", 0);
-          appendLog(colors.muted("  Message queued. Send to run after this turn."));
+          appendNotifyLog(colors.muted("  Message queued. Send to run after this turn."));
           appendLog("");
         }
         return;
@@ -2152,7 +2183,7 @@ export function Repl({ apiKey, cwd, onQuit }: ReplProps) {
             if (last) {
               applyInputMutation(last, last.length);
               setMessages((prev) => (prev.length > 0 && prev[prev.length - 1]?.role === "user" ? prev.slice(0, -1) : prev));
-              appendLog(colors.muted("  Editing previous message. Submit to replace."));
+              appendNotifyLog(colors.muted("  Editing previous message. Submit to replace."));
               appendLog("");
             }
           } else prevEscRef.current = true;
